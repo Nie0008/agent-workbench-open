@@ -1,0 +1,22 @@
+node_modules/
+dist/
+dist-test/
+release/
+sandbox/counter-page/.workbench/
+*.log
+.DS_Store
+
+# Local credentials and runtime state
+.env
+.env.*
+!.env.example
+control.json
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+.workbench/
+
+# Local reports may include machine paths and task material
+docs/analysis/
+docs/verification/
