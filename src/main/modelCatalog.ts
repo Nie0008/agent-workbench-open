@@ -6,8 +6,8 @@ import { GROK_SUPER_PROVIDER, GROK_SUPER_PROVIDER_ID, isGrokConfigProviderId } f
 
 export const MODEL_CATALOG_KEY = 'modelCatalog.v1';
 export const AGENT_IDS = ['claude-code', 'grok', 'dsh', 'zcode'] as const;
-// The catalog contains routing metadata only. API tokens remain in CC Switch or
-// Grok's own login; the Workbench database never receives a credential value.
+// The catalog contains routing metadata only. Local API keys are stored separately
+// as OS-encrypted ciphertext; CC Switch and Grok credentials stay in their sources.
 
 export interface ModelProfileInput extends Omit<ModelProfile, 'id' | 'sourceFingerprint'> { id?: string }
 
@@ -88,7 +88,7 @@ export class ModelCatalog {
     const item = validate(input);
     const profiles = this.list();
     const source = this.sourceInfo(item.providerId);
-    if (!source) throw new Error('凭据来源已不可用；请先检查 CC Switch 或 Grok 配置');
+    if (!source) throw new Error('凭据来源已不可用；请检查 Workbench 本地凭据、CC Switch 或 Grok 配置');
     if (item.providerId === GROK_SUPER_PROVIDER_ID && item.model !== GROK_SUPER_PROVIDER.model
       && !this.grokProviders().some((provider) => provider.model === item.model))
       throw new Error('Grok Build 尚未列出该模型，请先确认本机 Super 登录可用');

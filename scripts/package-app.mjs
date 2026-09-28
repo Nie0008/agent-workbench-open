@@ -12,7 +12,7 @@ const outApp = path.join(root, 'release', 'Agent Workbench.app');
 
 fs.rmSync(path.join(root, 'release'), { recursive: true, force: true });
 fs.mkdirSync(path.dirname(outApp), { recursive: true });
-execFileSync('cp', ['-R', src, outApp]);
+execFileSync('cp', ['-R', fs.realpathSync(src), outApp]);
 
 // 注入应用
 const resourcesDir = path.join(outApp, 'Contents', 'Resources');
@@ -21,6 +21,9 @@ fs.mkdirSync(appDir, { recursive: true });
 const copy = (p) => execFileSync('cp', ['-R', path.join(root, p), appDir]);
 copy('package.json');
 copy('dist');
+copy('bin');
+const cliLauncher = path.join(outApp, 'Contents', 'MacOS', 'agent-workbench');
+fs.writeFileSync(cliLauncher, '#!/bin/sh\nexec node "$(dirname "$0")/../Resources/app/bin/agent-workbench.mjs" "$@"\n', { mode: 0o755 });
 fs.mkdirSync(path.join(appDir, 'scripts'), { recursive: true });
 for (const file of ['grok-glm.py', 'agent-glm.py', 'dsh_acp.py']) {
   fs.copyFileSync(path.join(root, 'scripts', file), path.join(appDir, 'scripts', file));
@@ -53,13 +56,26 @@ const stageOnly = process.argv.includes('--stage-only');
 const homeApps = path.join(process.env.HOME ?? '', 'Applications');
 if (!stageOnly && fs.existsSync(path.dirname(homeApps))) {
   const dest = path.join(homeApps, 'Agent Workbench.app');
+  let installed = false;
   try {
     fs.rmSync(dest, { recursive: true, force: true });
     execFileSync('cp', ['-R', outApp, dest]);
     execFileSync('xattr', ['-rc', dest]);
+    installed = true;
     console.log(`已安装: ${dest}（双击运行请用此副本）`);
   } catch (e) {
     console.log(`安装到 ~/Applications 失败: ${String(e.message).slice(0, 120)}（可手动复制）`);
+  }
+  if (installed) try {
+    const binDir = path.join(process.env.HOME ?? '', '.local', 'bin');
+    const command = path.join(binDir, 'agent-workbench');
+    fs.mkdirSync(binDir, { recursive: true, mode: 0o700 });
+    if (!fs.lstatSync(command, { throwIfNoEntry: false })) {
+      fs.symlinkSync(path.join(dest, 'Contents', 'Resources', 'app', 'bin', 'agent-workbench.mjs'), command);
+      console.log(`已安装命令: ${command}`);
+    } else console.log(`命令位置已占用，未覆盖: ${command}`);
+  } catch (e) {
+    console.log(`命令安装失败: ${String(e.message).slice(0, 120)}（可手动运行应用内命令）`);
   }
 }
 

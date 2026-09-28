@@ -702,6 +702,9 @@ const MODEL_AGENT_IDS: ModelAgentId[] = ['claude-code', 'grok', 'dsh', 'zcode'];
 function ModelManagerModal({ info, onClose }: { info: AppInfo | null; onClose: () => void }) {
   const [catalog, setCatalog] = useState(info);
   const [draft, setDraft] = useState<ModelDraft | null>(null);
+  const [sourceDraft, setSourceDraft] = useState<{
+    providerId?: string; name: string; baseUrl: string; model: string; apiKey: string; authMode: 'api_key' | 'auth_token'
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
   const refresh = async () => {
@@ -751,13 +754,59 @@ function ModelManagerModal({ info, onClose }: { info: AppInfo | null; onClose: (
     setNotice(result.ok ? `已导入 ${result.data.added} 个新模型配置。` : result.error ?? '导入失败');
     if (result.ok) await refresh();
   };
+  const saveSource = async () => {
+    if (!sourceDraft || busy) return;
+    setBusy(true);
+    const result = await api('credentials.save', sourceDraft);
+    setBusy(false);
+    setSourceDraft((old) => old ? { ...old, apiKey: '' } : null);
+    if (!result.ok) { setNotice(result.error ?? '保存凭据失败'); return; }
+    setSourceDraft(null);
+    setNotice('本地凭据来源已保存，模型已加入目录。');
+    await refresh();
+  };
+  const deleteSource = async (providerId: string) => {
+    if (busy || !window.confirm('删除本地凭据来源？绑定此来源的任务将无法继续运行。')) return;
+    setBusy(true);
+    const result = await api('credentials.delete', { providerId });
+    setBusy(false);
+    setNotice(result.ok ? '本地凭据来源已删除。' : result.error ?? '删除失败');
+    if (result.ok) await refresh();
+  };
   const source = catalog?.sources.find((item) => item.providerId === draft?.providerId);
   const canUseGrok = draft?.providerId === 'grok-super-oauth' || draft?.providerId.startsWith('grok-config:')
     || source?.baseUrl.replace(/\/$/, '') === 'https://open.bigmodel.cn/api/anthropic';
   return <div className="modal-mask" onClick={onClose}>
     <div className="modal model-manager" onClick={(e) => e.stopPropagation()}>
       <h3>模型配置</h3>
-      <div className="combo-note">Workbench 在本机保存模型 ID、凭据来源和可用 Agent；密钥仍由 CC Switch 或 Grok 本机登录管理。</div>
+      <div className="combo-note">可直接添加 API key，或复用 CC Switch、Grok 的现有登录。本地 key 经 macOS 系统安全存储加密；界面不回显。</div>
+      <div className="model-manager-actions">
+        <button className="btn" onClick={() => { setSourceDraft({ name:'', baseUrl:'', model:'', apiKey:'', authMode:'api_key' }); setNotice(''); }}>＋ 添加 API 凭据</button>
+      </div>
+      {(catalog?.sources ?? []).filter((item) => item.providerId.startsWith('workbench-local:')).map((item) =>
+        <div className="model-manager-row" key={item.providerId}>
+          <div><strong>{item.name}</strong><span className="model-manager-detail">{item.model} · {item.baseUrl}</span></div>
+          <div><button className="btn small" onClick={() => setSourceDraft({ ...item, apiKey:'', authMode:item.authMode ?? 'api_key' })}>编辑</button>{' '}
+            <button className="btn small danger" disabled={busy} onClick={() => void deleteSource(item.providerId)}>删除</button></div>
+        </div>)}
+      {sourceDraft && <div className="model-manager-form">
+        <h3>{sourceDraft.providerId ? '编辑本地凭据来源' : '添加本地凭据来源'}</h3>
+        <label>名称</label>
+        <input type="text" value={sourceDraft.name} onChange={(e) => setSourceDraft({ ...sourceDraft, name:e.target.value })} placeholder="例如我的 Anthropic 兼容 API" />
+        <label>API 地址（HTTPS，Anthropic Messages 兼容）</label>
+        <input type="url" value={sourceDraft.baseUrl} disabled={!!sourceDraft.providerId} onChange={(e) => setSourceDraft({ ...sourceDraft, baseUrl:e.target.value })} placeholder="https://example.com/v1" />
+        <label>默认模型 ID</label>
+        <input type="text" value={sourceDraft.model} onChange={(e) => setSourceDraft({ ...sourceDraft, model:e.target.value })} placeholder="例如 my-model" />
+        <label>凭据类型</label>
+        <select value={sourceDraft.authMode} onChange={(e) => setSourceDraft({ ...sourceDraft, authMode:e.target.value as 'api_key' | 'auth_token' })}>
+          <option value="api_key">API key（ANTHROPIC_API_KEY）</option>
+          <option value="auth_token">代理令牌（ANTHROPIC_AUTH_TOKEN）</option>
+        </select>
+        <label>API key{sourceDraft.providerId ? '（留空则保留原 key）' : ''}</label>
+        <input type="password" autoComplete="new-password" value={sourceDraft.apiKey} onChange={(e) => setSourceDraft({ ...sourceDraft, apiKey:e.target.value })} />
+        <div className="foot"><button className="btn" onClick={() => setSourceDraft(null)}>取消</button>
+          <button className="btn primary" disabled={busy} onClick={() => void saveSource()}>保存凭据</button></div>
+      </div>}
       <div className="model-manager-actions">
         <button className="btn" onClick={newDraft}>＋ 添加模型</button>
         <button className="btn" disabled={busy} onClick={() => void importSources()}>导入当前来源</button>
@@ -778,7 +827,7 @@ function ModelManagerModal({ info, onClose }: { info: AppInfo | null; onClose: (
         <input type="text" value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} placeholder="例如 GLM 5.3 Flash" />
         <label>凭据来源</label>
         <select value={draft.providerId} onChange={(e) => selectSource(e.target.value)}>
-          {(catalog?.sources ?? []).map((item) => <option key={item.providerId} value={item.providerId}>{item.name}（{item.providerId === 'grok-super-oauth' || item.providerId.startsWith('grok-config:') ? 'Grok' : 'CC Switch'}）</option>)}
+          {(catalog?.sources ?? []).map((item) => <option key={item.providerId} value={item.providerId}>{item.name}（{item.providerId === 'grok-super-oauth' || item.providerId.startsWith('grok-config:') ? 'Grok' : item.providerId.startsWith('workbench-local:') ? 'Workbench' : 'CC Switch'}）</option>)}
         </select>
         <label>模型 ID</label>
         <input type="text" value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} placeholder="例如 glm-5.3-flash" />

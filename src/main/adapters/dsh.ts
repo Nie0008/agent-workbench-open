@@ -81,9 +81,9 @@ export class DshSession implements AgentSessionHandle {
       '--timeout', '14400', '--workbench-task-id', this.opts.taskId ?? path.basename(runDir),
       '--workbench-event-file', this.eventFile, '--workbench-control-dir', controlDir];
     if (this.nativeId) args.push('--resume', this.nativeId);
-    const env = { ...process.env } as NodeJS.ProcessEnv;
-    // The fixed launcher re-reads this exact provider binding and does not receive
-    // the TaskService secret on argv or in persisted session data.
+    const env = this.opts.providerId.startsWith('workbench-local:')
+      ? { ...this.opts.env } : { ...process.env } as NodeJS.ProcessEnv;
+    // CC Switch stays in its own DB; Workbench-owned secrets reach only this child env.
     const child = spawn(this.python, args, { cwd: this.opts.cwd, env, detached: true,
       stdio: ['pipe', 'pipe', 'pipe'] });
     child.stdin.end();

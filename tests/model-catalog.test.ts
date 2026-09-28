@@ -48,3 +48,46 @@ test('model catalog persists multiple models per credential for several agents w
     service.shutdown(); store.close(); cc.close(); fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('Workbench-owned key is encrypted at rest, reusable, and never falls back after deletion', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-local-key-'));
+  const store = new Store(path.join(root, 'wb.db'));
+  const vault = {
+    isEncryptionAvailable: () => true,
+    encryptString: (value: string) => Buffer.from(`sealed:${Buffer.from(value).toString('base64')}`),
+    decryptString: (value: Buffer) => Buffer.from(value.toString().slice(7), 'base64').toString(),
+  };
+  const credentials = new CredentialManager(path.join(root, 'no-cc-switch.db'), { store, vault, ttlMs: 0 });
+  const service = new TaskService(store, credentials, () => []);
+  try {
+    const key = 'LOCAL_KEY_ONLY_IN_MEMORY';
+    const source = service.saveCredentialSource({ name: 'Own API', baseUrl: 'https://example.invalid/v1',
+      model: 'model-one', apiKey: key });
+    assert.ok(source.providerId.startsWith('workbench-local:'));
+    assert.equal(store.countOccurrences(key), 0);
+    assert.ok(!JSON.stringify(service.agentOptions()).includes(key));
+    assert.ok(service.agentOptions().combinations.some((item) =>
+      item.providerId === source.providerId && item.model === 'model-one' && item.agentId === 'claude-code'));
+    const project = service.createProject(root);
+    const task = service.createMainSession({ projectId: project.id, title: 'Own key', agentId: 'claude-code',
+      providerId: source.providerId, model: 'model-one' });
+    assert.equal((service as any).buildEnv(task).ANTHROPIC_API_KEY, key);
+    const previous = process.env.ANTHROPIC_AUTH_TOKEN;
+    process.env.ANTHROPIC_AUTH_TOKEN = 'UNRELATED_INHERITED_KEY';
+    try { assert.equal((service as any).buildEnv(task).ANTHROPIC_AUTH_TOKEN, undefined); }
+    finally { if (previous === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN; else process.env.ANTHROPIC_AUTH_TOKEN = previous; }
+    service.saveCredentialSource({ ...source, apiKey: 'ROTATED_LOCAL_KEY' });
+    assert.equal((service as any).buildEnv(task).ANTHROPIC_API_KEY, 'ROTATED_LOCAL_KEY');
+    service.saveCredentialSource({ ...source, apiKey: '', authMode: 'auth_token' });
+    assert.equal((service as any).buildEnv(task).ANTHROPIC_AUTH_TOKEN, 'ROTATED_LOCAL_KEY');
+    assert.throws(() => service.saveCredentialSource({ ...source, baseUrl: 'https://changed.invalid/v1' }),
+      /不能更换 API 地址/);
+    service.deleteCredentialSource(source.providerId);
+    assert.equal(service.resolveSessionProvider(task.id).ok, false);
+    assert.equal(store.countOccurrences(key), 0);
+    store.setKV('credentialSources.v1', '{damaged');
+    assert.throws(() => service.saveCredentialSource({ name:'Another', baseUrl:'https://example.invalid/v1',
+      model:'model-two', apiKey:'FAKE_NEW_KEY' }), /记录损坏/);
+    assert.equal(store.getKV('credentialSources.v1'), '{damaged');
+  } finally { service.shutdown(); store.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});

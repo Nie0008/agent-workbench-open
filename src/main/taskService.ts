@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { Store } from './store';
 import { MemoryService, MEMORY_CONTEXT_HEADER, type MemoryEntryInput, type MemoryEntryPatch } from './memoryService';
 import { TaskWaiter, type WatchTarget } from './scheduler';
-import { CredentialManager } from './credentials';
+import { CredentialManager, type LocalSourceInput } from './credentials';
 import { ClaudeCodeAdapter } from './adapters/claude';
 import { DshAdapter } from './adapters/dsh';
 import { GrokAdapter } from './adapters/grok';
@@ -161,6 +161,13 @@ export class TaskService {
   saveModelProfile(input: ModelProfileInput) { return this.modelCatalog.save(input); }
   deleteModelProfile(id: string) { this.modelCatalog.remove(id); return { deleted: id }; }
   importModelProfiles() { return this.modelCatalog.importAvailable(); }
+  saveCredentialSource(input: LocalSourceInput) {
+    const source = this.credentials.saveLocalSource(input);
+    this.modelCatalog.importAvailable();
+    if (!this.store.getKV('defaultProviderId')) this.store.setKV('defaultProviderId', source.providerId);
+    return source;
+  }
+  deleteCredentialSource(providerId: string) { this.credentials.deleteLocalSource(providerId); return { deleted: providerId }; }
 
   setDefaultTaskCombo(agentId: string, providerId: string, model: string) {
     const selected = this.agentOptions().combinations.find((combo) => combo.agentId === agentId

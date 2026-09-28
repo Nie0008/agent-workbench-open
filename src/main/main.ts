@@ -1,5 +1,5 @@
 // Electron 主进程入口：窗口、服务装配、控制通道、启动恢复
-import { app, BrowserWindow, powerMonitor } from 'electron';
+import { app, BrowserWindow, powerMonitor, safeStorage } from 'electron';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -104,7 +104,7 @@ if (!gotLock) {
       log('[main] whenReady 开始');
       fs.mkdirSync(dataDir, { recursive: true });
       const store = process.env.WORKBENCH_SKIP_STORE === '1' ? null : new Store(path.join(dataDir, 'workbench.db'));
-      const credentials = new CredentialManager();
+      const credentials = new CredentialManager(undefined, { store: store ?? undefined, vault: safeStorage });
       taskService = new TaskService(store as any, credentials);
       if (store) nightly = new NightlyMemoryService(taskService);
       control = new ControlServer(taskService, nightly);

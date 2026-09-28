@@ -87,6 +87,8 @@ export function registerIpc(taskService: TaskService, getWindow: () => BrowserWi
   h('models.save', (p) => ts.saveModelProfile(p));
   h('models.delete', (p) => ts.deleteModelProfile(String(p.id ?? '')));
   h('models.import', () => ts.importModelProfiles());
+  h('credentials.save', (p) => ts.saveCredentialSource(p));
+  h('credentials.delete', (p) => ts.deleteCredentialSource(String(p.providerId ?? '')));
 
   h('sessions.create', (p) => ts.createMainSession({
     projectId: p.projectId, title: p.title, prompt: p.prompt, scope: { fileWrite: p.fileWrite === true },

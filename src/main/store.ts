@@ -1,5 +1,5 @@
 // 本地持久化：node:sqlite（Electron 主进程自带，无需原生编译）
-// 保存项目、会话、事件（含去重）、工具执行守卫、设置。凭据永不入库。
+// 保存项目、会话、事件（含去重）、工具执行守卫、设置。本地 API key 仅以系统加密后的密文入库。
 import { DatabaseSync } from 'node:sqlite';
 import type { WorkbenchEvent, SessionRow, SessionStatus, Project, TaskScope, MemoryEntry, MemoryInjectionSnapshot } from '../shared/types';
 

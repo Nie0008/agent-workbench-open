@@ -7,6 +7,12 @@ MODEL = 'glm-5.3-flash'
 BASE = 'https://open.bigmodel.cn/api/coding/paas/v4'
 
 def anthropic_provider(db, selected=None):
+    if selected and selected.startswith('workbench-local:'):
+        key=os.environ.get('ANTHROPIC_AUTH_TOKEN') or os.environ.get('ANTHROPIC_API_KEY')
+        base=os.environ.get('ANTHROPIC_BASE_URL','').rstrip('/')
+        if not key or not base.startswith('https://'):
+            raise ValueError('Workbench 本地凭据不可用')
+        return selected,key,base
     with sqlite3.connect('file:'+str(db)+'?mode=ro', uri=True) as conn:
         rows = conn.execute("SELECT id,settings_config FROM providers WHERE app_type='claude'").fetchall()
     matches=[]
