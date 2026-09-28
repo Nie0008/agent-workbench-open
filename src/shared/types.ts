@@ -106,6 +106,7 @@ export interface ProviderInfo {
   model: string;
   isCurrent?: boolean;
   authMode?: 'api_key' | 'auth_token';
+  importedFromCcSwitchId?: string;
 }
 
 export type ModelAgentId = 'claude-code' | 'grok' | 'dsh' | 'zcode';

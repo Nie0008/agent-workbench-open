@@ -88,6 +88,7 @@ export function registerIpc(taskService: TaskService, getWindow: () => BrowserWi
   h('models.delete', (p) => ts.deleteModelProfile(String(p.id ?? '')));
   h('models.import', () => ts.importModelProfiles());
   h('credentials.save', (p) => ts.saveCredentialSource(p));
+  h('credentials.importCcSwitch', (p) => ts.importCcSwitchCredential(String(p.providerId ?? '')));
   h('credentials.delete', (p) => ts.deleteCredentialSource(String(p.providerId ?? '')));
 
   h('sessions.create', (p) => ts.createMainSession({

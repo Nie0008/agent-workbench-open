@@ -91,3 +91,54 @@ test('Workbench-owned key is encrypted at rest, reusable, and never falls back a
     assert.equal(store.getKV('credentialSources.v1'), '{damaged');
   } finally { service.shutdown(); store.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('CC Switch configuration is copied into Workbench without exposing the key or rebinding old tasks', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-import-cc-'));
+  const ccPath = path.join(root, 'cc.db');
+  const cc = new DatabaseSync(ccPath);
+  cc.exec('CREATE TABLE providers(id TEXT PRIMARY KEY,app_type TEXT,name TEXT,settings_config TEXT,is_current INTEGER,sort_index INTEGER)');
+  const write = (key: string) => cc.prepare('INSERT INTO providers VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET settings_config=excluded.settings_config')
+    .run('cc-one', 'claude', 'Fixture CC', JSON.stringify({ env: {
+      ANTHROPIC_BASE_URL:'https://open.bigmodel.cn/api/anthropic', ANTHROPIC_MODEL:'glm-5.3-flash',
+      ANTHROPIC_AUTH_TOKEN:key, ANTHROPIC_DEFAULT_OPUS_MODEL:'glm-5.3-flash', API_TIMEOUT_MS:'600000',
+    } }), 1, 0);
+  write('IMPORT_FIXTURE_SECRET');
+  const store = new Store(path.join(root, 'workbench.db'));
+  const vault = {
+    isEncryptionAvailable: () => true,
+    encryptString: (value: string) => Buffer.from(`sealed:${Buffer.from(value).toString('base64')}`),
+    decryptString: (value: Buffer) => Buffer.from(value.toString().slice(7), 'base64').toString(),
+  };
+  const service = new TaskService(store, new CredentialManager(ccPath, { store, vault, ttlMs:0 }), () => []);
+  try {
+    const project = service.createProject(root);
+    service.saveModelProfile({ name:'Other model', providerId:'cc-one', model:'other-model', agents:['claude-code','dsh'] });
+    service.setDefaultTaskCombo('claude-code','cc-one','other-model');
+    store.setKV('defaultProviderId','cc-one');
+    const oldTask = service.createMainSession({ projectId:project.id, title:'Old', agentId:'claude-code', providerId:'cc-one', model:'other-model' });
+    const imported = service.importCcSwitchCredential('cc-one');
+    assert.ok(!JSON.stringify(imported).includes('IMPORT_FIXTURE_SECRET'));
+    assert.equal(imported.profilesCopied, 2);
+    assert.equal(imported.defaultChanged, true);
+    assert.equal(imported.existingTasksStillBound, 1);
+    assert.equal(store.getKV('defaultProviderId'), imported.source.providerId);
+    assert.equal(service.agentOptions().defaultTaskCombo?.providerId, imported.source.providerId);
+    assert.equal(service.getSession(oldTask.id)?.providerId, 'cc-one');
+    const newTask = service.createMainSession({ projectId:project.id, title:'New', agentId:'claude-code' });
+    assert.equal(newTask.providerId, imported.source.providerId);
+    assert.equal(newTask.model, 'other-model');
+    const env = (service as any).buildEnv(newTask);
+    assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'IMPORT_FIXTURE_SECRET');
+    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'glm-5.3-flash');
+    assert.equal(env.API_TIMEOUT_MS, '600000');
+    assert.equal(store.countOccurrences('IMPORT_FIXTURE_SECRET'), 0);
+    write('ROTATED_IMPORT_SECRET');
+    const again = service.importCcSwitchCredential('cc-one');
+    assert.equal(again.source.providerId, imported.source.providerId);
+    assert.equal(again.profilesCopied, 0);
+    assert.equal((service as any).buildEnv(newTask).ANTHROPIC_AUTH_TOKEN, 'ROTATED_IMPORT_SECRET');
+    cc.close(); fs.renameSync(ccPath, `${ccPath}.gone`);
+    assert.equal(service.resolveSessionProvider(newTask.id).ok, true);
+    assert.equal(service.resolveSessionProvider(oldTask.id).ok, false);
+  } finally { service.shutdown(); store.close(); try { cc.close(); } catch {} fs.rmSync(root, { recursive:true, force:true }); }
+});

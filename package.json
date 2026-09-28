@@ -1,7 +1,7 @@
 {
   "name": "agent-workbench",
   "productName": "Agent Workbench",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "private": true,
   "bin": {
     "agent-workbench": "bin/agent-workbench.mjs"

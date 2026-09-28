@@ -21,7 +21,7 @@ interface Vault {
   encryptString(value: string): Buffer;
   decryptString(value: Buffer): string;
 }
-interface LocalSource { providerId: string; name: string; baseUrl: string; model: string; encryptedKey: string; authMode: 'api_key' | 'auth_token' }
+interface LocalSource { providerId: string; name: string; baseUrl: string; model: string; encryptedKey: string; authMode: 'api_key' | 'auth_token'; baseEnv?: Record<string, string>; importedFromCcSwitchId?: string }
 export interface LocalSourceInput { providerId?: string; name: string; baseUrl: string; model: string; apiKey?: string; authMode?: 'api_key' | 'auth_token' }
 
 interface ResolvedEnv {
@@ -85,7 +85,7 @@ export class CredentialManager {
     throw new Error('本地凭据记录损坏，已停止写入以保护现有 key');
   }
 
-  saveLocalSource(input: LocalSourceInput): ProviderInfo {
+  saveLocalSource(input: LocalSourceInput, imported?: { sourceId: string; baseEnv: Record<string, string> }): ProviderInfo {
     if (!this.store || !this.vault?.isEncryptionAvailable()) throw new Error('系统安全存储不可用，无法保存 API key');
     const name = String(input.name ?? '').trim();
     const model = String(input.model ?? '').trim();
@@ -111,11 +111,28 @@ export class CredentialManager {
       try { encryptedKey = this.vault.encryptString(key).toString('base64'); }
       catch { throw new Error('API key 加密失败，未保存'); }
     }
-    const source = { providerId, name, baseUrl: url.toString().replace(/\/$/, ''), model, encryptedKey, authMode };
+    const source: LocalSource = { providerId, name, baseUrl: url.toString().replace(/\/$/, ''), model, encryptedKey, authMode,
+      ...(imported ? { importedFromCcSwitchId: imported.sourceId, baseEnv: imported.baseEnv }
+        : index >= 0 ? { importedFromCcSwitchId: rows[index].importedFromCcSwitchId, baseEnv: rows[index].baseEnv } : {}) };
     if (index >= 0) rows[index] = source; else rows.push(source);
     this.store.setKV(LOCAL_KEY, JSON.stringify(rows));
     this.cache.delete(providerId);
-    return { providerId, name, baseUrl: source.baseUrl, model, authMode, isCurrent: false };
+    return { providerId, name, baseUrl: source.baseUrl, model, authMode,
+      importedFromCcSwitchId: source.importedFromCcSwitchId, isCurrent: false };
+  }
+
+  importCcSwitchSource(providerId: string): ProviderInfo {
+    const original = this.listProviderInfos().find((item) => item.providerId === providerId && !item.providerId.startsWith(LOCAL_PREFIX));
+    const env = original && readProviderEnv(this.ccSwitchDb, providerId);
+    if (!original || !env?.base.ANTHROPIC_BASE_URL || !env.base.ANTHROPIC_MODEL)
+      throw new Error('CC Switch 来源不可用或缺少 API 地址、模型 ID');
+    const authMode = env.secret.ANTHROPIC_AUTH_TOKEN ? 'auth_token' : 'api_key';
+    const apiKey = env.secret.ANTHROPIC_AUTH_TOKEN || env.secret.ANTHROPIC_API_KEY;
+    if (!apiKey) throw new Error('CC Switch 来源缺少 API key');
+    const existing = this.localSources().find((item) => item.importedFromCcSwitchId === providerId);
+    return this.saveLocalSource({ providerId: existing?.providerId, name: original.name,
+      baseUrl: env.base.ANTHROPIC_BASE_URL, model: env.base.ANTHROPIC_MODEL, apiKey, authMode },
+      { sourceId: providerId, baseEnv: env.base });
   }
 
   deleteLocalSource(providerId: string): void {
@@ -146,7 +163,7 @@ export class CredentialManager {
       try {
         const key = row && this.vault?.isEncryptionAvailable()
           ? this.vault.decryptString(Buffer.from(row.encryptedKey, 'base64')) : '';
-        env = row && key ? { base: { ANTHROPIC_BASE_URL: row.baseUrl, ANTHROPIC_MODEL: row.model },
+        env = row && key ? { base: { ...row.baseEnv, ANTHROPIC_BASE_URL: row.baseUrl, ANTHROPIC_MODEL: row.model },
           secret: { [row.authMode === 'auth_token' ? 'ANTHROPIC_AUTH_TOKEN' : 'ANTHROPIC_API_KEY']: key } } : null;
       } catch { env = null; }
     } else env = readProviderEnv(this.ccSwitchDb, providerId);
@@ -179,7 +196,8 @@ export class CredentialManager {
     try {
       for (const row of this.localSources()) {
         if (this.resolve(row.providerId)) out.push({ providerId: row.providerId, name: row.name,
-          baseUrl: row.baseUrl, model: row.model, authMode: row.authMode ?? 'api_key', isCurrent: false });
+          baseUrl: row.baseUrl, model: row.model, authMode: row.authMode ?? 'api_key',
+          importedFromCcSwitchId: row.importedFromCcSwitchId, isCurrent: false });
       }
     } catch { /* malformed local sources cannot be used or overwritten */ }
     return out;

@@ -773,16 +773,34 @@ function ModelManagerModal({ info, onClose }: { info: AppInfo | null; onClose: (
     setNotice(result.ok ? '本地凭据来源已删除。' : result.error ?? '删除失败');
     if (result.ok) await refresh();
   };
+  const importCcSwitch = async (providerId: string) => {
+    if (busy) return;
+    setBusy(true);
+    const result = await api('credentials.importCcSwitch', { providerId });
+    setBusy(false);
+    if (!result.ok) { setNotice(result.error ?? '复制失败'); return; }
+    setNotice(`已将凭据加密复制到 Workbench；复制了 ${result.data.profilesCopied} 个模型配置。`
+      + (result.data.existingTasksStillBound ? `另有 ${result.data.existingTasksStillBound} 个已有任务仍绑定 CC Switch。` : ''));
+    await refresh();
+  };
   const source = catalog?.sources.find((item) => item.providerId === draft?.providerId);
   const canUseGrok = draft?.providerId === 'grok-super-oauth' || draft?.providerId.startsWith('grok-config:')
     || source?.baseUrl.replace(/\/$/, '') === 'https://open.bigmodel.cn/api/anthropic';
   return <div className="modal-mask" onClick={onClose}>
     <div className="modal model-manager" onClick={(e) => e.stopPropagation()}>
       <h3>模型配置</h3>
-      <div className="combo-note">可直接添加 API key，或复用 CC Switch、Grok 的现有登录。本地 key 经 macOS 系统安全存储加密；界面不回显。</div>
+      <div className="combo-note">可直接添加 API key，或从 CC Switch 复制到 Workbench。复制后新任务可使用本地凭据；已有任务保留原绑定。本地 key 经 macOS 系统安全存储加密，界面不回显。</div>
       <div className="model-manager-actions">
         <button className="btn" onClick={() => { setSourceDraft({ name:'', baseUrl:'', model:'', apiKey:'', authMode:'api_key' }); setNotice(''); }}>＋ 添加 API 凭据</button>
       </div>
+      {(catalog?.sources ?? []).filter((item) => !item.providerId.startsWith('workbench-local:')
+        && item.providerId !== 'grok-super-oauth' && !item.providerId.startsWith('grok-config:')).map((item) => {
+        const copied = catalog?.sources.some((source) => source.importedFromCcSwitchId === item.providerId);
+        return <div className="model-manager-row" key={item.providerId}>
+          <div><strong>{item.name}</strong><span className="model-manager-detail">CC Switch · {item.model} · {copied ? '已复制到 Workbench' : '尚未复制'}</span></div>
+          <button className="btn small" disabled={busy} onClick={() => void importCcSwitch(item.providerId)}>{copied ? '更新本地副本' : '复制到 Workbench'}</button>
+        </div>;
+      })}
       {(catalog?.sources ?? []).filter((item) => item.providerId.startsWith('workbench-local:')).map((item) =>
         <div className="model-manager-row" key={item.providerId}>
           <div><strong>{item.name}</strong><span className="model-manager-detail">{item.model} · {item.baseUrl}</span></div>

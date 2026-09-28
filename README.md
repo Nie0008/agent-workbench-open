@@ -1,6 +1,6 @@
 # Agent Workbench
 
-macOS 上的本地多 Agent 桌面工作台，用于项目背景交接、任务派发、授权处理、进度查看和结果回收。当前版本 0.3.2，支持 Claude Code、Grok Build、DSH 和 ZCode；Codex 可通过 MCP 向工作台派发任务。
+macOS 上的本地多 Agent 桌面工作台，用于项目背景交接、任务派发、授权处理、进度查看和结果回收。当前版本 0.3.3，支持 Claude Code、Grok Build、DSH 和 ZCode；Codex 可通过 MCP 向工作台派发任务。
 
 任务按工作目录归属项目。模型目录记录模型 ID、凭据来源与可用执行器，任务绑定创建时选定的模型；来源或模型变化时要求重新绑定，不会静默切换。每条任务后续消息复用执行器原生会话。运行结果仍需结合实际产物和验证证据核对。
 
@@ -35,7 +35,9 @@ DSH 和 ZCode 的 Python 启动器默认从 `PATH` 查找 `node`、`dsh`。桌�
 
 ## 凭据与数据
 
-在「模型配置」中可直接填写自己的 HTTPS Anthropic Messages 兼容端点、模型 ID 和 API key，或复用本机 CC Switch 供应商、Grok 登录。一般 API key 选择 `ANTHROPIC_API_KEY`；使用代理令牌的端点选择 `ANTHROPIC_AUTH_TOKEN`。Workbench 用 macOS 系统安全存储加密本地 key，数据库只保存密文，界面不回显；系统安全存储不可用时拒绝保存。CC Switch 和 Grok 凭据仍由各自配置管理。模型目录只保存模型与来源引用。缺少对应执行器或凭据时，该执行器不可用。当前直接填写的端点限 Anthropic Messages 兼容接口；Grok 自定义模型仍限项目已支持的智谱适配路径。
+在「模型配置」中可直接填写自己的 HTTPS Anthropic Messages 兼容端点、模型 ID 和 API key。已经使用 CC Switch 的本机用户可点某个来源旁的「复制到 Workbench」：主进程只读该来源配置，将 key 加密写入 Workbench，并复制其模型配置；不需要手工复制 key。重复点击可更新本地副本的 key。若原来源是默认来源，新任务的默认来源会改为 Workbench 本地副本。已有任务仍绑定原来源，尤其是可恢复的原生会话不会被静默换源；停用 CC Switch 前需逐项处理这些任务。Grok 登录仍由 Grok 管理。
+
+一般 API key 选择 `ANTHROPIC_API_KEY`；使用代理令牌的端点选择 `ANTHROPIC_AUTH_TOKEN`。Workbench 用 macOS 系统安全存储加密本地 key，数据库只保存密文，界面不回显；系统安全存储不可用时拒绝保存。模型目录只保存模型与来源引用。缺少对应执行器或凭据时，该执行器不可用。当前直接填写的端点限 Anthropic Messages 兼容接口；Grok 自定义模型仍限项目已支持的智谱适配路径。
 
 任务、项目背景和会话状态存在本机。应用通过选定的远端模型供应商执行任务；启用「夜间经验整理」后，Workbench 会在本地时间 03:00 或下次运行时，把启用后新增的成功任务要求与 Agent 结果发给配置好的智谱 `glm-5.3-flash`，生成待人工核对的项目经验草稿。首次启用不会补传更早的任务。该功能只读取 Workbench 自己记录的任务，不扫描其他客户端的独立会话。
 

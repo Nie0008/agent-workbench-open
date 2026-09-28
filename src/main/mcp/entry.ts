@@ -194,7 +194,7 @@ async function main() {
         jsonrpc: '2.0', id, result: {
           protocolVersion: params?.protocolVersion ?? '2025-06-18',
           capabilities: { tools: {} },
-          serverInfo: { name: 'agent-workbench-task-service', version: '0.3.2' },
+          serverInfo: { name: 'agent-workbench-task-service', version: '0.3.3' },
         },
       });
       return;

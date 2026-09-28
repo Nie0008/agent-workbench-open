@@ -10,12 +10,12 @@ import { ClaudeCodeAdapter } from './adapters/claude';
 import { DshAdapter } from './adapters/dsh';
 import { GrokAdapter } from './adapters/grok';
 import { ZCodeAdapter } from './adapters/zcode';
-import { ModelCatalog, type ModelProfileInput } from './modelCatalog';
+import { ModelCatalog, AGENT_IDS, type ModelProfileInput } from './modelCatalog';
 import { GROK_SUPER_MODEL, GROK_SUPER_PROVIDER, GROK_SUPER_PROVIDER_ID,
   isGrokConfigProviderId, listGrokConfigProviders, grokSuperConfigAvailable, grokNativeEnv } from './grok-models';
 import { MockAdapter, MockScript } from './adapters/mock';
 import type { AgentAdapter, AgentSessionHandle, AgentSessionOpts } from './adapters/types';
-import type { WorkbenchEvent, SessionRow, TaskScope, FileChangeInfo, SessionStatus, TaskUsageSummary, UsageField, UsageFieldCoverage, ProviderInfo, MemoryKind, MemoryStatus } from '../shared/types';
+import type { WorkbenchEvent, SessionRow, TaskScope, FileChangeInfo, SessionStatus, TaskUsageSummary, UsageField, UsageFieldCoverage, ProviderInfo, ModelProfile, MemoryKind, MemoryStatus } from '../shared/types';
 import {
   isGitRepo, createWorktree, removeWorktree, worktreeApply, worktreeMergeCheck,
   gitStatusChanges, WriteConflictGuard, canonicalPath, buildBackgroundSnapshot,
@@ -166,6 +166,49 @@ export class TaskService {
     this.modelCatalog.importAvailable();
     if (!this.store.getKV('defaultProviderId')) this.store.setKV('defaultProviderId', source.providerId);
     return source;
+  }
+  importCcSwitchCredential(providerId: string) {
+    if (!providerId || providerId.startsWith('workbench-local:') || providerId.startsWith('grok-'))
+      throw new Error('请选择 CC Switch 凭据来源');
+    return this.store.transaction(() => {
+      const original = this.credentials.listProviderInfos().find((item) => item.providerId === providerId);
+      if (!original) throw new Error('CC Switch 凭据来源不可用');
+      const profiles = this.modelCatalog.list().filter((item) => item.providerId === providerId);
+      const source = this.credentials.importCcSwitchSource(providerId);
+      if (source.model && !profiles.some((item) => item.model === source.model)) {
+        const zhipu = source.baseUrl.replace(/\/$/, '') === 'https://open.bigmodel.cn/api/anthropic';
+        profiles.push({ id:'', name:source.name, providerId, model:source.model,
+          agents:zhipu ? [...AGENT_IDS] : AGENT_IDS.filter((id) => id !== 'grok'), sourceFingerprint:'' });
+      }
+      let added = 0;
+      const copied = new Map<string, ModelProfile>();
+      for (const profile of profiles) {
+        let target = this.modelCatalog.find(source.providerId, profile.model);
+        if (!target) {
+          target = this.modelCatalog.save({ name:profile.name, providerId:source.providerId,
+            model:profile.model, agents:profile.agents, reasoningLevel:profile.reasoningLevel });
+          added++;
+        }
+        copied.set(profile.model, target);
+      }
+      const defaultProviderId = this.store.getKV('defaultProviderId');
+      const defaultChanged = !defaultProviderId || defaultProviderId === providerId;
+      if (defaultChanged) this.store.setKV('defaultProviderId', source.providerId);
+      for (const key of ['defaultTaskCombo', ...AGENT_IDS.map((id) => `defaultTaskCombo:${id}`)]) {
+        const raw = this.store.getKV(key);
+        if (!raw) continue;
+        try {
+          const saved = JSON.parse(raw);
+          const target = saved?.providerId === providerId ? copied.get(saved.model) : undefined;
+          if (target?.agents.includes(saved.agentId)) this.store.setKV(key, JSON.stringify({
+            ...saved, providerId:source.providerId, profileId:target.id,
+          }));
+        } catch { /* unrelated or invalid preference stays unchanged */ }
+      }
+      const existingTasksStillBound = this.store.listProjects().flatMap((project) => this.store.listSessions(project.id))
+        .filter((session) => session.providerId === providerId).length;
+      return { source, profilesCopied:added, defaultChanged, existingTasksStillBound };
+    });
   }
   deleteCredentialSource(providerId: string) { this.credentials.deleteLocalSource(providerId); return { deleted: providerId }; }
 
