@@ -77,7 +77,7 @@ args = ["/absolute/path/to/Agent Workbench.app/Contents/Resources/app/dist/main/
 
 桌面端可从顶部「项目背景」管理已确认背景和项目经验。已确认背景继续优先；经验只作为显式参考，不覆盖本次要求或权限。交接结果始终是待核对草稿，不会自动采用。只有明确采用且未过期的经验会用于后续新任务；已经开始的任务保留当时的背景快照，续接不会重复注入。
 
-`isolatedChecks.image` 必须是 `docker image inspect --format '{{.Id}}' <镜像>` 返回的完整本地 `sha256:` ID；`commands` 是 1–10 条单行精确命令。它们作为任务授权快照和幂等指纹保存。Claude Code 任务使用内置 `mcp__workbench__run_isolated_check` 执行；普通 Bash、ZCode 构建/测试和现有任务不会因此获得新权限。范围外命令会产生待授权，用户可从桌面任务卡片或 `workbench_list_permissions`/`workbench_respond_permission` 处理。通知用户不等于自动唤醒已结束的 Codex 对话；跨 Agent 自动交接仍需外部编排。
+`isolatedChecks.image` 必须是 `docker image inspect --format '{{.Id}}' <镜像>` 返回的完整本地 `sha256:` ID；`commands` 是 1–10 条单行精确命令。它们作为任务授权快照和幂等指纹保存。Claude Code 任务使用内置 `mcp__workbench__run_isolated_check` 执行；普通 Bash、ZCode 构建/测试和现有任务不会因此获得新权限。Windows 暂不支持隔离检查：新建任务传入此范围会被拒绝，已有任务调用该工具也会返回检查未运行的错误。范围外命令会产生待授权，用户可从桌面任务卡片或 `workbench_list_permissions`/`workbench_respond_permission` 处理。通知用户不等于自动唤醒已结束的 Codex 对话；跨 Agent 自动交接仍需外部编排。
 
 `readRoots` 是创建任务时传入的最多 20 个具体、现存的绝对目录。只有用户已授权读取这些目录时才传入；工作台保存目录的真实路径，仅用于 `Read/Glob/Grep/LS` 的目标核验。目录内的链接不能把授权扩大到其他位置，批量读取中任何目标越界都会请求确认。它不允许项目外写入，也不授予自由形式 Bash 或关闭沙箱的权限。旧任务缺省为空，不因升级自动扩大权限；相同创建请求仍须复用原 `clientRequestId`。
 

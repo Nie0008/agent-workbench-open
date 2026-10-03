@@ -19,6 +19,7 @@ $bin = Join-Path $InstallRoot 'bin'
 $backupApp = $null
 $backupBin = $null
 $installed = $false
+$binInstalled = $false
 $committed = $false
 if (-not ('WorkbenchInstall.NativePath' -as [type])) {
   Add-Type -TypeDefinition @'
@@ -147,6 +148,7 @@ try {
   Move-Item -LiteralPath (Join-Path $stage 'app') -Destination $app
   $installed = $true
   Move-Item -LiteralPath (Join-Path $stage 'bin') -Destination $bin
+  $binInstalled = $true
   if (-not $NoPath) {
     $userPath = [string][Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not (($userPath -split ';') | Where-Object { $_.TrimEnd('\') -ieq $bin.TrimEnd('\') })) {
@@ -164,10 +166,10 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "Installed successfully, but setup returned $LASTEXITCODE. Run workbench setup again." }
 } finally {
   if (-not $committed) {
+    if ($binInstalled -and (Test-Path -LiteralPath $bin)) { Remove-Item -LiteralPath $bin -Recurse -Force }
     if ($installed -and (Test-Path -LiteralPath $app)) { Remove-Item -LiteralPath $app -Recurse -Force }
     if ($backupApp -and (Test-Path -LiteralPath $backupApp)) { Move-Item -LiteralPath $backupApp -Destination $app }
     if ($backupBin -and (Test-Path -LiteralPath $backupBin)) {
-      if (Test-Path -LiteralPath $bin) { Remove-Item -LiteralPath $bin -Recurse -Force }
       Move-Item -LiteralPath $backupBin -Destination $bin
     }
   }
