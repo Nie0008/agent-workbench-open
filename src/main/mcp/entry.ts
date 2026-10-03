@@ -5,6 +5,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 import * as http from 'node:http';
+import { workbenchDataDir } from '../paths';
 
 interface Control { port: number; token: string; }
 
@@ -15,9 +16,7 @@ let controlPath = '';
 const ci = args.indexOf('--control');
 if (ci >= 0) controlPath = args[ci + 1];
 if (!controlPath) {
-  const dataDir = process.env.WORKBENCH_DATA_DIR
-    ?? path.join(process.env.HOME ?? '', 'Library', 'Application Support', 'Agent Workbench');
-  controlPath = path.join(dataDir, 'control.json');
+  controlPath = path.join(workbenchDataDir(), 'control.json');
 }
 
 function loadControl(): Control | null {
@@ -53,7 +52,7 @@ function rpc(method: string, params: any): Promise<any> {
 
 const EXTRA: Record<string, {method:string,description:string,properties:any,required?:string[]}> = {
   workbench_list_agent_options:{method:'agents.options',description:'列出工作台真正接入的 Agent 和当前可用供应商/模型（仅元数据，不返回凭据）；下发前据此选择 agentId/providerId/model。',properties:{}},
-  workbench_list_permissions:{method:'permissions.list',description:'读取指定任务的待授权操作详情。仅按已有用户授权处理，不扩大权限。',properties:{taskId:{type:'string'}},required:['taskId']},
+  workbench_list_permissions:{method:'permissions.list',description:'读取指定任务的待授权操作详情（含越界原因与完整输入）。同一原生工具调用的协议重试只会出现一条待授权。仅按已有用户授权处理，不扩大权限。',properties:{taskId:{type:'string'}},required:['taskId']},
   workbench_respond_permission:{method:'permissions.respondTask',description:'响应指定任务的一次授权请求；必须先读取操作详情并核对用户授权。',properties:{taskId:{type:'string'},permissionId:{type:'string'},decision:{type:'string',enum:['allow','deny']}},required:['taskId','permissionId','decision']},
   workbench_wait_task_events:{method:'tasks.wait',description:'等待1–8任务的关键事件；普通输出不唤醒，最多20秒，有游标重连。',properties:{targets:{type:'array',minItems:1,maxItems:8,items:{type:'object',properties:{taskId:{type:'string'},sinceSeq:{type:'integer',minimum:0}},required:['taskId','sinceSeq'],additionalProperties:false}},timeoutMs:{type:'integer',minimum:0,maximum:20000}},required:['targets']},
   workbench_get_progress:{method:'tasks.progress',description:'轻量任务进度；运行时存在不等于执行进程健康。',properties:{projectId:{type:'string'}}},
@@ -86,7 +85,7 @@ const TOOLS = [
   },
   {
     name: 'workbench_create_task',
-    description: '在指定项目新建主任务并发送首个提示词。指定 agentId 且省略 providerId/model 时使用工作台为该 Agent 保存的默认模型；单次指定不修改默认。可用组合由 workbench_list_agent_options 返回。fileWrite 控制是否允许项目内写文件。',
+    description: '在指定项目新建主任务并发送首个提示词。指定 agentId 且省略 providerId/model 时使用工作台为该 Agent 保存的默认模型。创建时传入授权范围：fileWrite=项目内写；readRoots=已获授权的额外绝对目录，仅 Read/Glob/Grep/LS 读取，不授予写入或 Bash 权限；bash=readonly 仅固定字面读取/指纹命令；network=网络工具；isolatedChecks=本地 Docker 镜像 sha256 ID 与精确构建/测试命令，Claude Code 经 run_isolated_check 在隔离副本执行。超出范围的操作暂停等待用户授权。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -96,6 +95,13 @@ const TOOLS = [
         title: { type: 'string' },
         prompt: { type: 'string' },
         fileWrite: { type: 'boolean', description: '默认 false；任务已获项目写入授权时才设 true' },
+        readRoots: { type: 'array', maxItems: 20, items: { type: 'string', maxLength: 4096 }, description: '额外只读的现存绝对目录；默认空，不能是文件系统根目录。仅明确授权后传入' },
+        bash: { type: 'string', enum: ['none', 'readonly'], description: 'Bash 授权模式，默认 none（逐条请求确认）' },
+        network: { type: 'boolean', description: '默认 false；允许网络工具时才设 true' },
+        isolatedChecks: { type: 'object', properties: {
+          image: { type: 'string', pattern: '^sha256:[a-f0-9]{64}$' },
+          commands: { type: 'array', minItems: 1, maxItems: 10, items: { type: 'string', maxLength: 500 } },
+        }, required: ['image', 'commands'], additionalProperties: false },
       },
       required: ['projectId', 'title', 'prompt'],
       additionalProperties: false,

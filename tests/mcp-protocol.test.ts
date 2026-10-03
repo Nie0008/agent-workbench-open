@@ -100,6 +100,9 @@ test('MCP：可启动、initialize、列工具', async () => {
     assert.ok(names.includes(n), `工具存在: ${n}`);
   }
   assert.ok(names.includes('workbench_list_agent_options'));
+  const createSchema = tools.result.tools.find((tool: any) => tool.name === 'workbench_create_task').inputSchema;
+  assert.equal(createSchema.properties.readRoots.type, 'array');
+  assert.equal(createSchema.properties.readRoots.maxItems, 20);
   const options = await send(rpc, 'tools/call', { name: 'workbench_list_agent_options', arguments: {} });
   const optionsData = JSON.parse(options.result.content[0].text);
   assert.deepEqual(optionsData.agents.map((agent: any) => agent.agentId).sort(), ['claude-code', 'dsh', 'grok', 'zcode']);
@@ -213,6 +216,27 @@ test('MCP：下发任务→事件→读结果→取消 全链路（模拟执行�
   // 取消
   const canceled = await send(rpc, 'tools/call', { name: 'workbench_cancel_task', arguments: { taskId: task.task.id } });
   assert.equal(JSON.parse(canceled.result.content[0].text).ok, true);
+});
+
+test('MCP：额外只读目录透传、固化与非法范围拒绝', async () => {
+  ts.registerMockScript('roots', { id: 'roots', steps: [{ t: 'result', text: 'done' }] });
+  const proj = ts.createProject(path.join(tmp, 'roots-project'));
+  const external = path.join(tmp, 'skills'); fs.mkdirSync(external);
+  const rpc = spawnEntry(); childProc = rpc.proc;
+  await send(rpc, 'initialize', { protocolVersion: '2025-06-18' });
+  const create = async (extra: any) => {
+    const response = await send(rpc, 'tools/call', { name: 'workbench_create_task', arguments: {
+      projectId: proj.id, title: '读取范围', prompt: 'done', agentId: 'mock', mockScript: 'roots', ...extra,
+    } });
+    return JSON.parse(response.result.content[0].text);
+  };
+  const created = await create({ readRoots: [external], clientRequestId: 'mcp-roots' });
+  assert.equal(created.ok, true);
+  assert.deepEqual(JSON.parse(ts.getSession(created.task.id)!.scopeJson).readRoots, [fs.realpathSync(external)]);
+  assert.equal((await create({ readRoots: [external], clientRequestId: 'mcp-roots' })).task.id, created.task.id);
+  assert.equal((await create({ readRoots: [], clientRequestId: 'mcp-roots' })).ok, false);
+  for (const readRoots of [['relative'], ['/'], [path.join(tmp, 'missing')]])
+    assert.equal((await create({ readRoots })).ok, false);
 });
 
 test('MCP：应用未运行时给出明确错误', async () => {

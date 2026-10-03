@@ -142,3 +142,65 @@ test('CC Switch configuration is copied into Workbench without exposing the key 
     assert.equal(service.resolveSessionProvider(oldTask.id).ok, false);
   } finally { service.shutdown(); store.close(); try { cc.close(); } catch {} fs.rmSync(root, { recursive:true, force:true }); }
 });
+
+test('native reference import preserves encrypted local sources, defaults and existing task bindings', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-native-local-compat-'));
+  const previous = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = path.join(root, 'claude');
+  fs.mkdirSync(process.env.CLAUDE_CONFIG_DIR);
+  const settings = path.join(process.env.CLAUDE_CONFIG_DIR, 'settings.json');
+  fs.writeFileSync(settings, JSON.stringify({ env: {
+    ANTHROPIC_BASE_URL: 'https://native.example.invalid', ANTHROPIC_MODEL: 'native-model',
+    ANTHROPIC_API_KEY: 'NATIVE_REFERENCE_FIXTURE_KEY',
+  } }));
+  const store = new Store(path.join(root, 'workbench.db'));
+  const vault = {
+    isEncryptionAvailable: () => true,
+    encryptString: (value: string) => Buffer.from(`sealed:${Buffer.from(value).toString('base64')}`),
+    decryptString: (value: Buffer) => Buffer.from(value.toString().slice(7), 'base64').toString(),
+  };
+  const credentials = new CredentialManager(path.join(root, 'missing-cc.db'), { store, vault, ttlMs: 0 });
+  const service = new TaskService(store, credentials, () => []);
+  try {
+    assert.equal(service.modelCatalog.list().length, 0, 'discovery does not import implicitly');
+    const source = service.saveCredentialSource({ name: 'Local source', baseUrl: 'https://local.example.invalid',
+      model: 'local-model', apiKey: 'LOCAL_PRESERVATION_FIXTURE_KEY' });
+    assert.deepEqual(service.modelCatalog.list().map(p => p.providerId), [source.providerId],
+      'saving a local key imports only that selected source');
+    service.setDefaultTaskCombo('claude-code', source.providerId, 'local-model');
+    const project = service.createProject(root);
+    const existing = service.createMainSession({ projectId: project.id, title: 'Existing local task', agentId: 'claude-code' });
+    const savedVault = store.getKV('credentialSources.v1');
+    const savedDefault = store.getKV('defaultTaskCombo');
+    // Configuration discovery has independent parser tests; isolate this import
+    // transaction from unrelated native configuration on the test machine.
+    service.scanConfiguration = () => ({ agents: [], warnings: [], fingerprint: 'fixture-scan', models: [
+      { id: 'provider:native:claude:native-model', name: 'Native', model: 'native-model', source: 'fixture',
+        path: settings, protocol: 'anthropic' as const, importable: true },
+    ] });
+    assert.throws(() => service.importConfiguration(false, 'fixture-scan'), /明确确认/);
+    assert.throws(() => service.importConfiguration(true, 'stale-scan'), /已变化/);
+    const imported = service.importConfiguration(true, 'fixture-scan');
+    assert.equal(imported.added, 1);
+    assert.equal(store.getKV('credentialSources.v1'), savedVault);
+    assert.equal(store.getKV('defaultProviderId'), source.providerId);
+    assert.equal(store.getKV('defaultTaskCombo'), savedDefault);
+    assert.equal(service.getSession(existing.id)?.providerId, source.providerId);
+    assert.equal((service as any).buildEnv(existing).ANTHROPIC_API_KEY, 'LOCAL_PRESERVATION_FIXTURE_KEY');
+    assert.throws(() => service.importCcSwitchCredential('native:claude'), /CC Switch/);
+    assert.throws(() => service.saveModelProfile({ name: 'Invalid native route', providerId: 'native:claude',
+      model: 'other-native-model', agents: ['dsh'] }), /仅供 Claude Code/);
+    const native = service.createMainSession({ projectId: project.id, title: 'Native task', agentId: 'claude-code',
+      providerId: 'native:claude', model: 'native-model' });
+    assert.equal((service as any).buildEnv(native).ANTHROPIC_API_KEY, 'NATIVE_REFERENCE_FIXTURE_KEY');
+    assert.equal(store.countOccurrences('NATIVE_REFERENCE_FIXTURE_KEY'), 0);
+    assert.equal(store.countOccurrences('LOCAL_PRESERVATION_FIXTURE_KEY'), 0);
+    fs.rmSync(settings);
+    assert.equal(service.resolveSessionProvider(native.id).ok, false, 'missing native credentials never fall back to the local key');
+    assert.equal(service.resolveSessionProvider(existing.id).ok, true);
+  } finally {
+    service.shutdown(); store.close();
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

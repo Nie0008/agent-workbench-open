@@ -5,6 +5,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { Store } from '../src/main/store';
 import { CredentialManager } from '../src/main/credentials';
 import { TaskService } from '../src/main/taskService';
@@ -48,12 +49,43 @@ afterEach(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+test('窗口不存在时通知持久化，迁移和已读游标不重复，最多保留 50 条', () => {
+  store.appendEvent('notice-task','result',{text:'历史结果'});
+  store.enableTaskNotices();
+  assert.deepEqual(store.taskNotices(),[],'启用前的历史不变成新通知');
+  store.appendEvent('notice-task','result',{isError:false,numTurns:0,text:''});
+  assert.deepEqual(store.taskNotices(),[],'忽略空预热结果');
+  const pending=store.appendEvent('notice-task','permission_request',{permissionId:'p'});
+  const notice={id:`notice-task:${pending.seq}`,taskId:'notice-task',label:'等你授权',time:pending.createdAt};
+  store.importTaskNotices([notice,{...notice,id:'legacy',taskId:'old-task',privatePayload:'drop'}]);
+  assert.equal(store.taskNotices().length,2,'迁移与数据库事件去重');
+  assert.equal(Object.hasOwn(store.taskNotices().find(n=>n.id==='legacy')!,'privatePayload'),false);
+  store.ackTaskNotices('notice-task');
+  store.ackTaskNotices('old-task');
+  store.importTaskNotices([notice]);
+  assert.deepEqual(store.taskNotices(),[],'只迁移一次，已读通知不复活');
+  store.appendEvent('notice-task','error',{text:'新错误'});
+  store.close();
+  store=new Store(path.join(tmp,'wb.db'));
+  assert.equal(store.taskNotices()[0].label,'执行出错','重新打开数据库后新通知仍在');
+  const raw=new DatabaseSync(path.join(tmp,'wb.db'));
+  raw.prepare('INSERT INTO events(session_id,seq,type,payload,created_at) VALUES (?,?,?,?,?)')
+    .run('bad-payload',1,'error','{broken',new Date().toISOString());
+  raw.close();
+  assert.equal(store.taskNotices().length,1,'损坏 JSON 不阻塞通知读取');
+  for(let i=0;i<55;i++)store.appendEvent('notice-task','result',{text:`结果 ${i}`});
+  assert.equal(store.taskNotices().length,50);
+  store.ackTaskNotices('notice-task');
+  assert.deepEqual(store.taskNotices(),[]);
+});
+
 test('模拟会话：流式事件、工具调用、文件变更、用量与完成状态', async () => {
   ts.registerMockScript('mock-main', COUNTER_SCRIPT);
   const proj = ts.createProject(path.join(tmp, 'proj-a'));
   const sess = ts.createMainSession({ projectId: proj.id, title: '计数页面', agentId: 'mock', mockScript: 'mock-main', prompt: '做一个计数页面' });
   assert.equal(sess.agentId, 'mock');
-  await wait(300);
+  for (let i = 0; i < 200 && (ts.getSession(sess.id)?.status !== 'idle'
+    || !eventsOf(sess.id).some((e) => e.type === 'result')); i++) await wait(25);
   const evs = eventsOf(sess.id);
   const types = evs.map((e) => e.type);
   assert.ok(types.includes('message'), '用户消息已记录');
@@ -325,7 +357,7 @@ test('退出重开：历史完整、进行中任务标为恢复中、原生恢�
 });
 
 test('泄漏测试：假密钥哨兵不进入日志与本地库（正向对照后归零）', async () => {
-  const SENTINEL = 'FAKE_SENTINEL_KEY_FOR_TEST_1234567890';
+  const SENTINEL = 'SK-SENTINEL-FAKE-KEY-1234567890';
   ts.registerMockScript('mock-leak', { id: 'leak', steps: [{ t: 'result', text: 'done' }] });
   const proj = ts.createProject(path.join(tmp, 'proj-j'));
   const sess = ts.createMainSession({ projectId: proj.id, title: '泄漏测试', agentId: 'mock', mockScript: 'mock-leak', prompt: `不要泄漏 ${'x'}` });
@@ -348,6 +380,64 @@ test('readTaskResult 汇总：状态/摘要/文件/用量', async () => {
   assert.ok(r.result!.filesChanged.some((f: any) => f.path === 'index.html'));
   assert.equal(r.result!.usage.inputTokens, 120);
   assert.equal(r.result!.usage.costKnown, false, '费用未知标记');
+});
+
+test('长历史：新消息广播、首次消息判断、末尾结果草稿与用量文件不受 2000 条限制', async () => {
+  ts.registerMockScript('long-history', { id:'long-history', steps:[
+    { t:'usage', inputTokens:20, outputTokens:4, costUSD:0.2 },
+    { t:'result', text:'末尾成功结果' },
+  ] });
+  const proj = ts.createProject(path.join(tmp, 'proj-long-history'));
+  const sess = ts.createMainSession({ projectId:proj.id, title:'长历史', agentId:'mock', mockScript:'long-history' });
+  store.transaction(() => {
+    store.appendEvent(sess.id, 'result', { isError:false, text:'早期成功结果' });
+    store.appendEvent(sess.id, 'usage', { inputTokens:10, outputTokens:2, costUSD:0.1 });
+    store.appendEvent(sess.id, 'file_change', { path:'early.txt', change:'add', origin:sess.id });
+    for (let i=0; i<2050; i++) store.appendEvent(sess.id, 'text_delta', { text:'历史增量' });
+    store.appendEvent(sess.id, 'message', { role:'user', text:'已有用户消息位于第一页之后' });
+    store.appendEvent(sess.id, 'file_change', { path:'late.txt', change:'modify', origin:sess.id });
+  });
+  store.setKV(`background:${sess.id}`, JSON.stringify({ facts:'不应再次注入的背景', projectVersion:1, source:'test' }));
+  const broadcasts: WorkbenchEvent[] = [];
+  ts.broadcast = (e) => broadcasts.push(e);
+  assert.equal((await ts.send(sess.id, '继续长历史任务')).ok, true);
+  for (let i=0; i<100 && ts.getSession(sess.id)?.summary !== '末尾成功结果'; i++) await wait(10);
+  const user = broadcasts.find((e) => e.type === 'message' && e.payload.role === 'user');
+  assert.ok(user && user.seq > 2000, '广播的是新追加消息');
+  assert.equal(user.payload.text, '继续长历史任务', '已有用户消息后不重新注入背景');
+  const result = ts.readTaskResult(sess.id).result!;
+  assert.deepEqual(result.filesChanged.map((f: any) => f.path), ['early.txt', 'late.txt']);
+  assert.equal(result.usage.roundsRecorded, 2);
+  assert.equal(result.usage.inputTokens, 30);
+  assert.equal(result.usage.outputTokens, 6);
+  assert.ok(Math.abs(result.usage.costUSD - 0.3) < 1e-12);
+  const latestResult = store.latestSuccessfulResult(sess.id)!;
+  const draft = ts.createHandoffDraft(sess.id);
+  assert.ok(draft.entry.body.includes('末尾成功结果'));
+  assert.ok(draft.entry.evidenceRefs.includes(`event:seq:${latestResult.seq}`));
+  store.appendEvent(sess.id, 'result', { isError:true, text:'更晚的失败记录' });
+  assert.equal(ts.createHandoffDraft(sess.id).entry.id, draft.entry.id, '只选最新成功结果且重复草稿幂等');
+  assert.equal(store.listEvents(sess.id).length, 2000, '通用事件读取仍保留默认分页上限');
+});
+
+test('启动授权恢复只读取请求 ID，保留重复未决请求并容忍坏 JSON', () => {
+  store.appendEvent('task-a', 'permission_request', { permissionId:'resolved-id', input:{ text:'x'.repeat(1024 * 1024) } });
+  store.appendEvent('task-b', 'permission_resolved', { permissionId:'resolved-id', decision:'allow' });
+  const pending = store.appendEvent('task-a', 'permission_request', { permissionId:'pending-"id', input:{ text:'x'.repeat(1024 * 1024) } });
+  const repeated = store.appendEvent('task-a', 'permission_request', { permissionId:'pending-"id' });
+  store.appendEvent('task-a', 'permission_request', {});
+  const corruptRequest = store.appendEvent('task-a', 'permission_request', {});
+  const corruptResolution = store.appendEvent('task-a', 'permission_resolved', {});
+  const db = new DatabaseSync(path.join(tmp, 'wb.db'));
+  try {
+    const corrupt = db.prepare('UPDATE events SET payload=? WHERE session_id=? AND seq=?');
+    corrupt.run('{broken', 'task-a', corruptRequest.seq);
+    corrupt.run('{broken', 'task-a', corruptResolution.seq);
+  } finally { db.close(); }
+  assert.deepEqual([...store.unresolvedPermissionRequests()], [['task-a', [
+    { seq:pending.seq, permissionId:'pending-"id' },
+    { seq:repeated.seq, permissionId:'pending-"id' },
+  ]]]);
 });
 
 // ---- 用量统计：多轮累计、未知费用、历史缺字段、重开一致性 ----

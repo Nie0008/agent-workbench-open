@@ -28,6 +28,8 @@ function validate(input: ModelProfileInput): ModelProfileInput {
   if (reasoningLevel && !/^[a-z0-9_-]{1,30}$/i.test(reasoningLevel)) throw new Error('思考级别格式无效');
   if ((providerId === GROK_SUPER_PROVIDER_ID || isGrokConfigProviderId(providerId)) && agents.some((id) => id !== 'grok'))
     throw new Error('Grok 登录或 Grok 配置仅能供 Grok Build 使用');
+  if (providerId === 'native:claude' && agents.some(id => id !== 'claude-code'))
+    throw new Error('Claude Code 原生凭据当前仅供 Claude Code 执行器使用');
   return { name, providerId, model, agents, ...(reasoningLevel ? { reasoningLevel } : {}) };
 }
 
@@ -44,38 +46,21 @@ export class ModelCatalog {
   }
 
   list(): ModelProfile[] {
-    const stored = this.read();
-    if (stored !== null) return stored;
-    // Import only once. From then on, new models are added through Workbench's
-    // model manager or an explicit import, never silently bound to old tasks.
-    const seed: ModelProfile[] = [];
-    for (const provider of this.credentials.listProviderInfos()) {
-      if (!provider.model) continue;
-      const zhipu = provider.baseUrl.replace(/\/$/, '') === 'https://open.bigmodel.cn/api/anthropic';
-      seed.push({ id: crypto.randomUUID(), name: provider.name, providerId: provider.providerId,
-        model: provider.model, agents: zhipu ? [...AGENT_IDS] : ['claude-code', 'dsh', 'zcode'], sourceFingerprint: fingerprint(provider),
-        ...(provider.model === 'glm-5.3-flash' ? { reasoningLevel: 'max' } : {}) });
-    }
-    seed.push({ id: crypto.randomUUID(), name: GROK_SUPER_PROVIDER.name,
-      providerId: GROK_SUPER_PROVIDER_ID, model: GROK_SUPER_PROVIDER.model, agents: ['grok'], sourceFingerprint: fingerprint(GROK_SUPER_PROVIDER) });
-    for (const provider of this.grokProviders()) {
-      seed.push({ id: crypto.randomUUID(), name: provider.name, providerId: provider.providerId,
-        model: provider.model, agents: ['grok'], sourceFingerprint: fingerprint(provider) });
-    }
-    this.store.setKV(MODEL_CATALOG_KEY, JSON.stringify(seed));
-    return seed;
+    // Discovery is read-only. A fresh installation imports only after consent.
+    return this.read() ?? [];
   }
 
-  importAvailable(): { added: number; profiles: ModelProfile[] } {
+  importAvailable(sourceIds?: string[]): { added: number; profiles: ModelProfile[] } {
     const profiles = this.list();
     const sources = [...this.credentials.listProviderInfos(), GROK_SUPER_PROVIDER, ...this.grokProviders()];
     let added = 0;
     for (const source of sources) {
+      if (sourceIds && !sourceIds.includes(source.providerId)) continue;
       if (!source.model || profiles.some((p) => p.providerId === source.providerId && p.model === source.model)) continue;
       const native = source.providerId === GROK_SUPER_PROVIDER_ID || isGrokConfigProviderId(source.providerId);
       const zhipu = source.baseUrl.replace(/\/$/, '') === 'https://open.bigmodel.cn/api/anthropic';
       profiles.push({ id: crypto.randomUUID(), name: source.name, providerId: source.providerId,
-        model: source.model, agents: native ? ['grok'] : zhipu ? [...AGENT_IDS] : ['claude-code', 'dsh', 'zcode'],
+        model: source.model, agents: native ? ['grok'] : source.providerId === 'native:claude' ? ['claude-code'] : zhipu ? [...AGENT_IDS] : ['claude-code', 'dsh', 'zcode'],
         sourceFingerprint: fingerprint(source),
         ...(source.model === 'glm-5.3-flash' && !native ? { reasoningLevel: 'max' } : {}) });
       added++;

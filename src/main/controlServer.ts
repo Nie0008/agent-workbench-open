@@ -16,6 +16,7 @@ export class ControlServer {
   captureFn: (() => Promise<string>) | null = null;   // 返回 PNG base64
   evalFn: ((expr: string) => Promise<string>) | null = null;  // 仅调试
   desktopFn: ((action?: 'show' | 'hide') => Promise<unknown>) | null = null;
+  openTaskFn: ((taskId: string) => void) | null = null;   // 通知点击同款入口：打开工作台并定位任务
 
   constructor(private taskService: TaskService, private nightly?: NightlyMemoryService | null) {
     this.server = http.createServer((req, res) => this.route(req, res));
@@ -71,6 +72,13 @@ export class ControlServer {
           return { ok: false, error: '未知窗口操作' };
         return { ok: true, desktop: await this.desktopFn(p.action) };
       }
+      case 'app.openTask': {
+        // 与系统通知点击同一入口：打开工作台并定位任务（不改变任何权限状态）
+        if (!this.openTaskFn) return { ok: false, error: '桌面入口不可用' };
+        if (typeof p.taskId !== 'string' || !p.taskId) return { ok: false, error: '缺少 taskId' };
+        this.openTaskFn(p.taskId);
+        return { ok: true };
+      }
       case 'app.capture': {
         if (!this.captureFn) return { ok: false, error: '截图能力不可用' };
         const png = await this.captureFn();
@@ -89,6 +97,8 @@ export class ControlServer {
       case 'agents.options': {
         return { ok: true, ...ts.agentOptions(p.refreshModels === true) };
       }
+      case 'config.scan': return { ok: true, ...ts.scanConfiguration() };
+      case 'config.import': return { ok: true, ...ts.importConfiguration(p.confirmed, p.fingerprint) };
       case 'projects.list':
         return { ok: true, projects: ts.listProjects() };
       case 'projects.create': {
@@ -123,8 +133,18 @@ export class ControlServer {
         return r;
       }
       case 'task.create': {
+        // 范围来源：优先完整 scope 对象（严格校验）；兼容旧的顶层字段简写。
+        // 未传任何范围时按最严格范围创建（外部派发默认不做任何自动放行）。
+        const scopeInput = p.scope !== undefined ? p.scope : {
+          ...(p.fileWrite !== undefined ? { fileWrite: p.fileWrite === true } : {}),
+          ...(p.bash !== undefined ? { bash: p.bash } : {}),
+          ...(p.network !== undefined ? { network: p.network === true } : {}),
+          ...(p.readRoots !== undefined ? { readRoots: p.readRoots } : {}),
+          ...(p.isolatedChecks !== undefined ? { isolatedChecks: p.isolatedChecks } : {}),
+        };
         const s = ts.createMainSession({
-          projectId: p.projectId, title: p.title ?? '外部任务', prompt: p.prompt, scope: { fileWrite: p.fileWrite === true },
+          projectId: p.projectId, title: p.title ?? '外部任务', prompt: p.prompt, scope: scopeInput,
+          scopeSource: 'control',
           background:p.background, clientRequestId:p.clientRequestId,
           agentId: p.agentId ?? 'claude-code', model: p.model, providerId: p.providerId, mockScript: p.mockScript,
         });
@@ -168,9 +188,11 @@ export class ControlServer {
       case 'permissions.list': return ts.listPendingPermissions(p.taskId);
       case 'permissions.respondTask':
         if (typeof p.taskId !== 'string' || !p.taskId) return {ok:false,error:'必须指定任务'};
-        return ts.respondPermission(p.permissionId, p.decision, p.taskId);
+        if (p.decision !== 'allow' && p.decision !== 'deny') return {ok:false,error:'decision 仅支持 allow/deny'};
+        return ts.respondPermission(p.permissionId, p.decision, p.taskId, 'control');
       case 'permissions.respond':
-        return ts.respondPermission(p.permissionId, p.decision);
+        if (p.decision !== 'allow' && p.decision !== 'deny') return {ok:false,error:'decision 仅支持 allow/deny'};
+        return ts.respondPermission(p.permissionId, p.decision, undefined, 'control');
       case 'settings.get':
         return { ok: true, settings: ts.getSettings() };
       case 'settings.set':

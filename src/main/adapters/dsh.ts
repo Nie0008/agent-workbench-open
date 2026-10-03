@@ -5,6 +5,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
 import type { AgentAdapter, AgentSessionHandle, AgentSessionOpts } from './types';
+import { resolveNodeExecutable, resolvePythonExecutable, resolveRuntimeExecutable, pythonArguments, signalOwnedProcess } from './types';
 
 
 function launcherPath(): string {
@@ -44,7 +45,7 @@ export class DshSession implements AgentSessionHandle {
 
   constructor(private opts: AgentSessionOpts,
               private launcher: string = launcherPath(),
-              private python: string = '/usr/bin/python3') {
+              private python?: string) {
     this.nativeId = opts.resumeNativeSessionId ?? null;
   }
 
@@ -54,7 +55,7 @@ export class DshSession implements AgentSessionHandle {
     if (this.disposed) throw new Error('DSH runtime 已关闭');
     if (this.child) throw new Error('DSH 当前回合尚未结束');
     if (!this.opts.model) throw new Error('DSH 任务未绑定模型');
-    if (!this.opts.providerId) throw new Error('DSH 任务未绑定 CC Switch 供应商');
+    if (!this.opts.providerId) throw new Error('DSH 任务未绑定凭据来源');
     this.turnFinished = false;
     this.stopped = false;
     this.reportedModel = false;
@@ -76,15 +77,20 @@ export class DshSession implements AgentSessionHandle {
     fs.mkdirSync(controlDir, { mode: 0o700 });
     fs.writeFileSync(promptFile, text, { mode: 0o600 });
 
-    const args = [this.launcher, 'dsh', 'run', '--cwd', this.opts.cwd,
+    const python=this.python ?? resolvePythonExecutable();
+    const args = [...pythonArguments(python),this.launcher, 'dsh', 'run', '--cwd', this.opts.cwd,
       '--prompt-file', promptFile, '--provider-id', this.opts.providerId, '--model', this.opts.model,
       '--timeout', '14400', '--workbench-task-id', this.opts.taskId ?? path.basename(runDir),
       '--workbench-event-file', this.eventFile, '--workbench-control-dir', controlDir];
     if (this.nativeId) args.push('--resume', this.nativeId);
     const env = this.opts.providerId.startsWith('workbench-local:')
       ? { ...this.opts.env } : { ...process.env } as NodeJS.ProcessEnv;
+    const dsh = resolveRuntimeExecutable('dsh', 'WORKBENCH_DSH_PATH');
+    if (dsh) env.WORKBENCH_DSH_PATH = dsh;
+    env.WORKBENCH_NODE_PATH = resolveNodeExecutable();
+    if (env.WORKBENCH_NODE_PATH === process.execPath && process.versions.electron) env.ELECTRON_RUN_AS_NODE = '1';
     // CC Switch stays in its own DB; Workbench-owned secrets reach only this child env.
-    const child = spawn(this.python, args, { cwd: this.opts.cwd, env, detached: true,
+    const child = spawn(python, args, { cwd: this.opts.cwd, env, detached: process.platform !== 'win32', windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'] });
     child.stdin.end();
     this.child = child;
@@ -150,7 +156,10 @@ export class DshSession implements AgentSessionHandle {
       const call = this.toolCalls.get(callId);
       const name = call?.name ?? 'DSH 工具操作';
       const input = call?.input ?? { toolCallId: callId, details: event.request };
-      void (this.opts.canUseTool?.(name, input) ?? Promise.resolve({ behavior: 'deny' as const }))
+      void (this.opts.canUseTool?.(name, input, {
+        toolUseId: callId || requestId,
+        requestId: /^[a-f0-9]{32}$/.test(requestId) ? requestId : undefined,
+      }) ?? Promise.resolve({ behavior: 'deny' as const }))
         .then((decision) => {
           if (!this.runDir || !this.child || this.stopped) return;
           const dest = path.join(controlDir, requestId + '.json');
@@ -213,9 +222,9 @@ export class DshSession implements AgentSessionHandle {
   async interrupt(): Promise<void> {
     this.stopped = true;
     if (this.child?.pid) {
-      try { process.kill(-this.child.pid, 'SIGTERM'); } catch { /* already exited */ }
+      try { signalOwnedProcess(this.child.pid, 'SIGTERM'); } catch { /* already exited */ }
       await Promise.race([this.processDone, new Promise<void>((resolve) => setTimeout(resolve, 5000))]);
-      if (this.child?.pid) { try { process.kill(-this.child.pid, 'SIGKILL'); } catch { /* exited */ } }
+      if (this.child?.pid) { try { signalOwnedProcess(this.child.pid, 'SIGKILL'); } catch { /* exited */ } }
     }
   }
 

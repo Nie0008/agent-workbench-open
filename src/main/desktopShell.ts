@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, nativeImage, Tray } from 'electron';
+import { app, BrowserWindow, dialog, Menu, nativeImage, Tray } from 'electron';
 
 // A monochrome dashboard icon; scaleFactor keeps it at 16 points on Retina displays.
 function menuBarImage() {
@@ -23,17 +23,20 @@ export class DesktopShell {
   private visibilityEpoch = 0;
   private lastDockShow = 0;
   private dockHideTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingCount = 0;
 
-  constructor(private createWindow: () => BrowserWindow, private reportError: (message: string) => void) {}
+  constructor(private createWindow: () => BrowserWindow, private reportError: (message: string) => void,
+    private saveWindowState: (win: BrowserWindow) => Promise<void>) {}
 
-  async start() {
+  async start(hidden = false) {
     try {
       this.tray = new Tray(menuBarImage());
       this.refreshMenu();
     } catch (error) {
       this.reportError(`菜单栏图标创建失败: ${String(error)}`);
     }
-    await this.show();
+    if (!hidden || !this.tray) await this.show();
+    else app.dock?.hide();
   }
 
   getWindow() { return this.win && !this.win.isDestroyed() ? this.win : null; }
@@ -42,6 +45,7 @@ export class DesktopShell {
     const win = this.getWindow();
     return {
       trayReady: !!this.tray && !this.tray.isDestroyed(),
+      windowPresent: !!win,
       windowVisible: !!win?.isVisible(),
       windowMinimized: !!win?.isMinimized(),
       dockVisible: app.dock?.isVisible() ?? null,
@@ -64,10 +68,10 @@ export class DesktopShell {
       win.on('close', (event) => {
         if (!this.quitting && this.tray && !this.tray.isDestroyed()) {
           event.preventDefault();
-          this.hide();
+          void this.hide();
         }
       });
-      win.on('minimize', () => { if (!this.quitting) this.hide(); });
+      win.on('minimize', () => { if (!this.quitting) void this.hide(); });
       const visibilityChanged = () => {
         this.refreshMenu();
         if (!win.webContents.isDestroyed()) win.webContents.send('wb:visibility', win.isVisible());
@@ -83,10 +87,25 @@ export class DesktopShell {
     this.refreshMenu();
   }
 
-  hide(): boolean {
+  async hide(): Promise<boolean> {
     if (this.quitting || !this.tray || this.tray.isDestroyed()) return false;
-    this.visibilityEpoch++;
-    this.getWindow()?.hide();
+    const epoch = ++this.visibilityEpoch;
+    const win = this.getWindow();
+    if (win) {
+      try { await this.saveWindowState(win); }
+      catch (error) {
+        this.reportError(`收起失败: ${String(error)}`);
+        if (!win.isDestroyed()) {
+          if (win.isMinimized()) win.restore();
+          win.show();
+          void dialog.showMessageBox(win, {type:'error',message:'未能保存窗口内容，已保留窗口',
+            detail:`请稍后重试。${String(error instanceof Error ? error.message : error)}`});
+        }
+        return false;
+      }
+      if (this.quitting || epoch !== this.visibilityEpoch || this.getWindow() !== win) return false;
+      win.destroy();
+    }
     app.dock?.hide();
     this.clearDockHideTimer();
     if (app.dock) {
@@ -114,15 +133,38 @@ export class DesktopShell {
     this.tray = null;
   }
 
+  // 服务端事实驱动的待授权计数：菜单栏直接提供"处理授权"入口（点击打开工作台）
+  setPendingCount(count: number) {
+    const next = Math.max(0, count);
+    if (next === this.pendingCount && this.tray && !this.tray.isDestroyed()) return;
+    this.pendingCount = next;
+    this.refreshMenu();
+  }
+
+  // 系统通知点击入口：打开工作台并定位到对应任务。
+  // 时序：show() 是异步的（窗口可能尚未创建/加载），必须等待完成后再发事件；
+  // 加载中用 did-finish-load 兜底，已加载则直接发送，避免冷启动丢事件。
+  openTask(taskId: string) {
+    void this.show().then(() => {
+      const win = this.getWindow();
+      if (!win || win.webContents.isDestroyed()) return;
+      const send = () => { if (!win.webContents.isDestroyed()) win.webContents.send('wb:open-task', taskId); };
+      if (win.webContents.isLoading()) win.webContents.once('did-finish-load', send);
+      else send();
+    }).catch((error) => this.reportError(String(error)));
+  }
+
   private refreshMenu() {
     if (!this.tray || this.tray.isDestroyed()) return;
     const visible = !!this.getWindow()?.isVisible();
-    this.tray.setToolTip(`Agent Workbench · ${visible ? '工作台已打开' : '后台运行'}`);
+    const pending = this.pendingCount;
+    this.tray.setToolTip(`Agent Workbench · ${pending > 0 ? `${pending} 项待授权` : visible ? '工作台已打开' : '后台运行'}`);
     this.tray.setContextMenu(Menu.buildFromTemplate([
       { label: 'Agent Workbench', enabled: false },
       { type: 'separator' },
+      ...(pending > 0 ? [{ label: `⛔ ${pending} 项待授权 — 打开处理`, click: () => { void this.show().catch((error) => this.reportError(String(error))); } }] : []),
       { label: '打开工作台', click: () => { void this.show().catch((error) => this.reportError(String(error))); } },
-      { label: '收起到菜单栏', enabled: visible, click: () => { this.hide(); } },
+      { label: '收起到菜单栏', enabled: visible, click: () => { void this.hide(); } },
       { type: 'separator' },
       { label: '退出 Agent Workbench', click: () => app.quit() },
     ]));

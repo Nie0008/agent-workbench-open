@@ -1,22 +1,21 @@
 {
   "name": "agent-workbench",
   "productName": "Agent Workbench",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "private": true,
-  "bin": {
-    "agent-workbench": "bin/agent-workbench.mjs"
-  },
-  "description": "多 Agent 桌面工作台（macOS）：Claude Code、Grok、DSH、ZCode 调度",
+  "description": "多 Agent 桌面工作台：标准 MCP / 命令主控，Claude Code、Grok、DSH、ZCode 调度",
   "main": "dist/main/main.js",
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
     "start": "npm run build && electron .",
-    "test": "npm run build:test && node --test \"dist-test/taskflow.test.js\" \"dist-test/mcp-protocol.test.js\" \"dist-test/provider-binding.test.js\" \"dist-test/hardening.test.js\" \"dist-test/renderer-send.test.js\" \"dist-test/scheduler.test.js\" \"dist-test/grok-adapter.test.js\" \"dist-test/dsh-adapter.test.js\" \"dist-test/zcode-adapter.test.js\" \"dist-test/external-registration.test.js\" \"dist-test/model-catalog.test.js\" \"dist-test/memory.test.js\" \"dist-test/cli.test.js\"",
+    "test": "npm run build:test && node --test --test-concurrency=4 \"dist-test/*.test.js\"",
     "build:test": "node scripts/build.mjs --test",
     "mcp": "node dist/main/mcp/entry.js",
-    "cli": "node bin/agent-workbench.mjs",
-    "package": "node scripts/package-app.mjs"
+    "package": "node scripts/package-app.mjs",
+    "workbench": "node dist/main/cli.js",
+    "package:portable": "node scripts/package-platform.mjs",
+    "cli": "node bin/agent-workbench.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.270",
@@ -29,7 +28,16 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "electron": "^41.10.7",
-    "esbuild": "^0.28.2",
+    "esbuild": "^0.24.0",
     "typescript": "^5.7.0"
-  }
+  },
+  "bin": {
+    "agent-workbench": "bin/agent-workbench.mjs"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Nie0008/agent-workbench-open.git"
+  },
+  "homepage": "https://github.com/Nie0008/agent-workbench-open"
 }

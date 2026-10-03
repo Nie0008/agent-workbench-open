@@ -1,5 +1,6 @@
 """Bounded ACP client. The parent owns provider routing and process-group timeout."""
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -7,6 +8,10 @@ import threading
 import time
 import uuid
 from pathlib import Path
+
+spec = importlib.util.spec_from_file_location('workbench_runtime', Path(__file__).with_name('grok-glm.py'))
+runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runtime)
 
 
 class Client:
@@ -93,11 +98,15 @@ class Client:
         try:
             self.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            self.process.terminate()
+            # The POSIX child shares the parent launcher's process group. The
+            # parent owns group cleanup; this client can only terminate its PID.
+            if os.name == 'nt': runtime.terminate_owned_process(self.process)
+            else: self.process.terminate()
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                if os.name == 'nt': runtime.terminate_owned_process(self.process, force=True)
+                else: self.process.kill()
                 self.process.wait()
         self.reader.join(timeout=2)
 
@@ -112,7 +121,7 @@ def run(binary, patch, state, cwd, prompt, resume, action, run_id):
     os.umask(0o077)
     state = Path(state)
     event_file = Path(os.environ['WORKBENCH_DSH_EVENT_FILE']) if os.environ.get('WORKBENCH_DSH_EVENT_FILE') else state / ('events-' + run_id + '.jsonl')
-    client = Client([binary, '--profile', 'acp', '--patch', patch], event_file)
+    client = Client(runtime.cli_command(binary) + ['--profile', 'acp', '--patch', patch], event_file)
     sid = resume
     opened = False
     report = {'sessionId': sid, 'eventFile': str(event_file), 'resumed': bool(resume)}

@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
 """DSH/ZCode model entry; model-gated loopback bridge, no persistent provider secret."""
-import argparse,fcntl,hashlib,http.client,http.server,importlib.util,json,os,secrets,shutil,signal,subprocess,sys,tempfile,threading,time
+import argparse,hashlib,http.client,http.server,importlib.util,json,os,secrets,subprocess,sys,tempfile,threading,time
 from pathlib import Path
 from urllib.parse import urlsplit
 spec=importlib.util.spec_from_file_location('grok_glm',Path(__file__).with_name('grok-glm.py'))
 shared=importlib.util.module_from_spec(spec);spec.loader.exec_module(shared)
-NODE=Path(os.environ.get('WORKBENCH_NODE_PATH') or shutil.which('node') or '')
-DSH=Path(os.environ.get('WORKBENCH_DSH_PATH') or shutil.which('dsh') or '')
-ZCODE=Path(os.environ.get('WORKBENCH_ZCODE_CLI') or '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs')
-BUILTIN=Path(os.environ.get('ZCODE_BUILTIN_PROVIDER_CONFIG_FILE') or '/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json')
+if os.name == 'nt':
+ import msvcrt
+ fcntl=None
+else:
+ import fcntl
+ msvcrt=None
+NODE=None
+DSH=None
+ZCODE=Path('/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs')
+BUILTIN=Path('/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json')
+
+def acquire_run_lock(handle,windows=None):
+ windows=os.name=='nt' if windows is None else windows
+ if windows:
+  handle.seek(0,os.SEEK_END)
+  if handle.tell()==0:handle.write(b'0');handle.flush()
+  handle.seek(0);msvcrt.locking(handle.fileno(),msvcrt.LK_NBLCK,1)
+ else:fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
 
 def main():
  p=argparse.ArgumentParser(description=__doc__)
@@ -29,8 +43,12 @@ def main():
   if a.tool!='dsh' or a.action!='run' or not all([a.workbench_task_id,a.workbench_event_file,a.workbench_control_dir]):
    raise ValueError('Workbench ACP options require DSH run and all three fields')
   if not all(c.isalnum() or c in '-_' for c in a.workbench_task_id):raise ValueError('Invalid Workbench task ID')
- required=[DSH] if a.tool=='dsh' else [NODE,ZCODE,BUILTIN]
- if not all(x.is_file() for x in required):raise ValueError('CLI installation or bundled provider config missing')
+ node=NODE or shared.runtime_executable('node','WORKBENCH_NODE_PATH')
+ dsh=DSH or shared.runtime_executable('dsh','WORKBENCH_DSH_PATH')
+ zcode=Path(os.environ.get('WORKBENCH_ZCODE_CLI') or str(ZCODE))
+ builtin=Path(os.environ.get('ZCODE_BUILTIN_PROVIDER_CONFIG_FILE') or str(BUILTIN))
+ required=[dsh] if a.tool=='dsh' else [node,zcode,builtin]
+ if not all(x is not None and x.is_file() for x in required):raise ValueError('CLI installation or bundled provider config missing')
  binding_key=str(cwd)+(('\x00'+a.workbench_task_id) if a.workbench_task_id else '')
  state=Path.home()/'.local/share/agent-workbench'/('fixed-'+a.tool)/hashlib.sha256(binding_key.encode()).hexdigest()[:20]
  if a.action=='status':
@@ -53,9 +71,9 @@ def main():
   print(json.dumps({'tool':a.tool,'configurationChecked':True,'inferenceVerified':False,**binding}));return 0
  lock=None
  if a.tool=='dsh':
-  lock=(state/'active.lock').open('a')
-  try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-  except BlockingIOError:raise ValueError('DSH project already has an active run; do not duplicate dispatch')
+  lock=(state/'active.lock').open('a+b')
+  try:acquire_run_lock(lock)
+  except OSError:lock.close();raise ValueError('DSH project already has an active run; do not duplicate dispatch')
  prompt='Reply only: '+a.tool.upper()+'_GLM_OK. Do not use tools, read files, or modify anything.' if a.action=='smoke' else (a.prompt_file.read_text() if a.prompt_file else '')
  token=secrets.token_urlsafe(32);events=[]
  class Handler(http.server.BaseHTTPRequestHandler):
@@ -88,6 +106,7 @@ def main():
  url='http://127.0.0.1:'+str(server.server_port)
  env={k:v for k,v in os.environ.items() if not (k.startswith(('ANTHROPIC_','ZCODE_','DSH_')) or k in ['ZHIPU_API_KEY','XAI_API_KEY','CC_TEST_KEY','WORKBENCH_GLM_KEY'])}
  env['WORKBENCH_GLM_LOCAL_TOKEN']=token
+ if node is not None:env['WORKBENCH_NODE_PATH']=str(node)
  start=time.time();proc=None;returncode=2;out='';err=''
  try:
   with tempfile.TemporaryDirectory(prefix='run-',dir=state) as temp:
@@ -104,28 +123,28 @@ def main():
      env['WORKBENCH_DSH_CONTROL_DIR']=str(a.workbench_control_dir)
     prompt_path=tmp/'prompt.txt';prompt_path.write_text(prompt)
     run_id=secrets.token_hex(12)
-    cmd=[sys.executable,str(Path(__file__).with_name('dsh_acp.py')),str(DSH),str(f),str(state),str(cwd),str(prompt_path),a.resume or '',a.action,run_id]
+    cmd=[sys.executable,str(Path(__file__).with_name('dsh_acp.py')),str(dsh),str(f),str(state),str(cwd),str(prompt_path),a.resume or '',a.action,run_id]
    else:
     data=state/'data';cli=data/'.zcode/cli';cli.mkdir(parents=True,exist_ok=True,mode=0o700)
     env['ZCODE_DATA_BASE_DIR']=str(data)
     personal={'schemaVersion':1,'config':{'providerConfigRules':{'providerRules':[{'providerId':'cc-workbench','providerName':'Workbench Model','config':{'group':'standard-personal','access':{'type':'api-key','apiKey':token},'api':{'type':'anthropic-messages','baseUrl':url},'personalModelIds':[model]}}]},'modelConfigRules':{'providerModelRules':[{'providerId':'cc-workbench','modelId':model,'config':{'properties':{'contextWindow':200000}}}],'manualProviderModelRules':[]},'defaultModelSelection':{'providerId':'cc-workbench','modelId':model}}}
     f=tmp/'personal.json';f.write_text(json.dumps(personal));f.chmod(0o600)
     (cli/'config.json').write_text(json.dumps({'model':{'main':'cc-workbench/'+model}}))
-    env.update(ZCODE_PERSONAL_PROVIDER_CONFIG_FILE=str(f),ZCODE_BUILTIN_PROVIDER_CONFIG_FILE=str(BUILTIN))
-    cmd=[str(NODE),str(ZCODE),'-p',prompt,'--cwd',str(cwd),'--mode','plan' if a.action=='smoke' else a.mode,'--surface','terminal','--json']
+    env.update(ZCODE_PERSONAL_PROVIDER_CONFIG_FILE=str(f),ZCODE_BUILTIN_PROVIDER_CONFIG_FILE=str(builtin))
+    cmd=[str(node),str(zcode),'-p',prompt,'--cwd',str(cwd),'--mode','plan' if a.action=='smoke' else a.mode,'--surface','terminal','--json']
     if a.resume:cmd+=['--resume',a.resume]
-   proc=subprocess.Popen(cmd,cwd=cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+   proc=subprocess.Popen(cmd,cwd=cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,**shared.spawn_options())
    try:out,err=proc.communicate(timeout=a.timeout);returncode=proc.returncode
    except subprocess.TimeoutExpired:
-    os.killpg(proc.pid,signal.SIGTERM)
+    shared.terminate_owned_process(proc)
     try:out,err=proc.communicate(timeout=5)
-    except subprocess.TimeoutExpired:os.killpg(proc.pid,signal.SIGKILL);out,err=proc.communicate()
+    except subprocess.TimeoutExpired:shared.terminate_owned_process(proc,force=True);out,err=proc.communicate()
     returncode=124
  finally:
   if proc is not None and proc.poll() is None:
-   os.killpg(proc.pid,signal.SIGTERM)
+   shared.terminate_owned_process(proc)
    try:proc.wait(timeout=5)
-   except subprocess.TimeoutExpired:os.killpg(proc.pid,signal.SIGKILL);proc.wait()
+   except subprocess.TimeoutExpired:shared.terminate_owned_process(proc,force=True);proc.wait()
   server.shutdown();server.server_close()
  # Provider secrets never enter child env/config/output; redact local token as well.
  out=out.replace(key,'[REDACTED]').replace(token,'[LOCAL_TOKEN]');err=err.replace(key,'[REDACTED]').replace(token,'[LOCAL_TOKEN]')

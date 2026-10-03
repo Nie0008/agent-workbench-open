@@ -19,8 +19,8 @@ export type EventType =
   | 'message'              // 完整消息 payload:{role:'assistant'|'user', text}
   | 'tool_request'         // payload:{toolUseId,name,input}
   | 'tool_result'          // payload:{toolUseId,name,ok,brief}
-  | 'permission_request'   // payload:{permissionId,toolName,input,reason}
-  | 'permission_resolved'  // payload:{permissionId,decision:'allow'|'deny'}
+  | 'permission_request'   // payload:{permissionId,toolName,input,reason,toolUseId}
+  | 'permission_resolved'  // payload:{permissionId,decision:'allow'|'deny'|'invalidated',reason?}
   | 'file_change'          // payload:{path,change:'add'|'modify'|'delete',origin}
   | 'task_delegated'       // payload:{subTaskId,title,instructions}
   | 'subtask_status'       // payload:{subTaskId,status,summary?}
@@ -29,6 +29,7 @@ export type EventType =
   | 'result'               // payload:{isError,numTurns,text}
   | 'error'                // payload:{message}
   | 'conflict'             // payload:{kind:'write'|'merge', path?, detail}
+  | 'scope'                // 范围快照 payload:{scope, text}（创建/派生时一次，append-only 可审计）
   | 'notice';              // payload:{text}
 
 export interface WorkbenchEvent {
@@ -86,17 +87,25 @@ export interface SessionRow {
   status: SessionStatus;
   nativeSessionId: string | null;
   cwd: string;                    // 主任务=项目根；子任务=worktree 或项目根
-  scopeJson: string;              // {fileWrite:boolean}
+  scopeJson: string;              // TaskScope（见 shared/scope.ts；旧数据缺省字段按最严格解释）
   delegationJson: string | null;  // {instructions, contextFiles, acceptance, snapshot?}
   summary: string | null;         // 最近一次 result 摘要
   providerId: string | null;      // 会话绑定供应商；NULL=旧数据未绑定
+  scopeSource: string | null;     // 范围来源 ui/mcp/control/derived/legacy；NULL=旧数据
   createdAt: string;
   updatedAt: string;
 }
 
 export interface TaskScope {
   fileWrite: boolean;   // 允许在项目（或 worktree）内写文件
+  bash: 'none' | 'readonly'; // none=Bash 逐条请求；readonly=严格只读/指纹命令自动放行（见 policy.ts）
+  network: boolean;     // 允许 WebFetch/WebSearch 等网络工具
+  readRoots?: string[]; // 额外只读目录（创建时 realpath 固化）；不授予写入或 Bash 权限
+  isolatedChecks?: { image: string; commands: string[] }; // 固定本地镜像 ID + 精确命令；仅隔离副本执行
 }
+
+// 授权范围快照来源：ui=界面创建 / mcp=外部 MCP / control=控制通道 / derived=子任务派生 / legacy=旧数据
+export type ScopeSource = 'ui' | 'mcp' | 'control' | 'derived' | 'legacy';
 
 export interface ProviderInfo {
   providerId: string;
@@ -141,6 +150,13 @@ export type AdapterEvent =
 export interface PermissionOutcome {
   behavior: 'allow' | 'deny';
   message?: string;
+}
+
+// 适配器能拿到的原生调用上下文：同一原生工具调用的协议重试共享同一 toolUseId。
+// 统一策略据此把"同一次调用的重试"与"文本相同的新调用"区分开。
+export interface PermissionContext {
+  toolUseId?: string;   // 原生工具调用 ID（Claude toolUseID / ZCode·DSH·Grok toolCallId）
+  requestId?: string;   // 执行器协议层的请求 ID（如 Claude control request_id）
 }
 
 export interface TurnOptions {

@@ -2,6 +2,7 @@
 // 保存项目、会话、事件（含去重）、工具执行守卫、设置。本地 API key 仅以系统加密后的密文入库。
 import { DatabaseSync } from 'node:sqlite';
 import type { WorkbenchEvent, SessionRow, SessionStatus, Project, TaskScope, MemoryEntry, MemoryInjectionSnapshot } from '../shared/types';
+import { noticeLabel, type TaskNotice } from '../shared/task-notices';
 
 export interface NewSessionInput {
   id: string;
@@ -12,7 +13,7 @@ export interface NewSessionInput {
   agentId: string;
   model: string;
   cwd: string;
-  scope: TaskScope;
+  scope: TaskScope | Partial<TaskScope>;   // 完整范围由 TaskService 校验后传入；Store 只做持久化
   providerId?: string | null;   // 会话绑定供应商；NULL=旧数据/未选择，真实调用前需用户确认绑定
   delegation?: { instructions: string; contextFiles?: string[]; acceptance?: string; snapshot?: unknown } | null;
 }
@@ -85,6 +86,8 @@ export class Store {
     // 迁移：v0.1.0 旧库无 provider_id。旧会话保持 NULL（不可靠记录不擅自绑定当前供应商），
     // 用户在界面确认绑定后才能真实调用。
     try { db.exec(`ALTER TABLE sessions ADD COLUMN provider_id TEXT`); } catch { /* 已存在 */ }
+    // 迁移：授权范围快照来源（ui/mcp/control/derived/legacy）；旧任务一律 legacy，不回填扩大
+    try { db.exec(`ALTER TABLE sessions ADD COLUMN scope_source TEXT`); } catch { /* 已存在 */ }
     this.db = db;
     return db;
   }
@@ -160,12 +163,13 @@ export class Store {
   }
 
   // ---- sessions ----
-  createSession(s: NewSessionInput): void {
+  createSession(s: NewSessionInput & { scopeSource?: string }): void {
     const now = new Date().toISOString();
-    this.ensure().prepare(`INSERT INTO sessions(id,project_id,kind,parent_session_id,title,agent_id,model,status,cwd,scope_json,delegation_json,provider_id,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    this.ensure().prepare(`INSERT INTO sessions(id,project_id,kind,parent_session_id,title,agent_id,model,status,cwd,scope_json,scope_source,delegation_json,provider_id,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(s.id, s.projectId, s.kind, s.parentSessionId ?? null, s.title, s.agentId, s.model,
-        'idle', s.cwd, JSON.stringify(s.scope), s.delegation ? JSON.stringify(s.delegation) : null,
+        'idle', s.cwd, JSON.stringify(s.scope), s.scopeSource ?? 'legacy',
+        s.delegation ? JSON.stringify(s.delegation) : null,
         s.providerId ?? null, now, now);
   }
   bindProvider(id: string, providerId: string): void {
@@ -218,7 +222,33 @@ export class Store {
       nativeSessionId: r.native_session_id, cwd: r.cwd, scopeJson: r.scope_json,
       delegationJson: r.delegation_json, summary: r.summary, createdAt: r.created_at, updatedAt: r.updated_at,
       providerId: r.provider_id ?? null,
+      scopeSource: r.scope_source ?? null,
     };
+  }
+
+  // 启动恢复前查询：未决（无对应 permission_resolved）的授权请求事件，按任务分组。
+  // 用于把已消失回调显式失效，避免重启后界面仍显示可批准的幽灵授权。
+  unresolvedPermissionRequests(): Map<string, Array<{ seq: number; permissionId: string | null }>> {
+    const rows = this.ensure().prepare(
+      "SELECT session_id, seq, CASE WHEN json_valid(payload) THEN payload -> '$.permissionId' END AS permission_id " +
+      "FROM events WHERE type='permission_request' ORDER BY seq").all() as unknown as any[];
+    const resolved = new Set<string>();
+    const resolutions = this.ensure().prepare(
+      "SELECT CASE WHEN json_valid(payload) THEN payload -> '$.permissionId' END AS permission_id " +
+      "FROM events WHERE type='permission_resolved'").all() as unknown as any[];
+    for (const r of resolutions) {
+      try { resolved.add(String(JSON.parse(r.permission_id ?? 'null') ?? '')); } catch { /* 忽略坏行 */ }
+    }
+    const out = new Map<string, Array<{ seq: number; permissionId: string | null }>>();
+    for (const r of rows) {
+      let permissionId: string | null = null;
+      try { permissionId = JSON.parse(r.permission_id ?? 'null') ?? null; } catch { /* 忽略坏行 */ }
+      if (!permissionId || resolved.has(permissionId)) continue;
+      const list = out.get(r.session_id) ?? [];
+      list.push({ seq: Number(r.seq), permissionId });
+      out.set(r.session_id, list);
+    }
+    return out;
   }
 
   // ---- events（append-only，UNIQUE(session,seq) 保证重放不重复）----
@@ -237,6 +267,24 @@ export class Store {
       'SELECT * FROM events WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?').all(sessionId, sinceSeq, limit) as unknown as any[];
     return rows.map((r) => ({ id: r.id, seq: r.seq, sessionId: r.session_id, type: r.type, payload: JSON.parse(r.payload), createdAt: r.created_at }));
   }
+  hasUserMessage(sessionId: string): boolean {
+    return !!this.ensure().prepare(
+      "SELECT 1 FROM events WHERE session_id=? AND type='message' AND json_extract(payload,'$.role')='user' LIMIT 1")
+      .get(sessionId);
+  }
+  latestSuccessfulResult(sessionId: string): WorkbenchEvent | null {
+    const r: any = this.ensure().prepare(
+      "SELECT * FROM events WHERE session_id=? AND type='result' AND json_type(payload,'$.isError')='false' ORDER BY seq DESC LIMIT 1")
+      .get(sessionId);
+    return r ? { id:r.id, seq:r.seq, sessionId:r.session_id, type:r.type, payload:JSON.parse(r.payload), createdAt:r.created_at } : null;
+  }
+  listEventsByTypes(sessionId: string, types: string[]): WorkbenchEvent[] {
+    if (!types.length) return [];
+    const rows = this.ensure().prepare(
+      `SELECT * FROM events WHERE session_id=? AND type IN (${types.map(() => '?').join(',')}) ORDER BY seq`)
+      .all(sessionId, ...types) as any[];
+    return rows.map((r) => ({ id:r.id, seq:r.seq, sessionId:r.session_id, type:r.type, payload:JSON.parse(r.payload), createdAt:r.created_at }));
+  }
   lastSeq(sessionId: string): number {
     const r: any = this.ensure().prepare('SELECT MAX(seq) AS m FROM events WHERE session_id=?').get(sessionId);
     return r?.m ? Number(r.m) : 0;
@@ -245,6 +293,53 @@ export class Store {
   latestEventId(): number {
     const row: any = this.ensure().prepare('SELECT COALESCE(MAX(id),0) AS id FROM events').get();
     return Number(row.id);
+  }
+
+  enableTaskNotices() {
+    if (this.getKV('notices.since.v1') === null) this.setKV('notices.since.v1', String(this.latestEventId()));
+  }
+  taskNotices(): TaskNotice[] {
+    this.enableTaskNotices();
+    // Events already persist while no window exists. Project only notification metadata,
+    // and keep per-task acknowledgement cursors rather than a second event queue.
+    const rows = this.ensure().prepare(`SELECT e.session_id,e.seq,e.type,e.created_at,
+      json_extract(e.payload,'$.isError') AS is_error,
+      json_extract(e.payload,'$.numTurns') AS turns,
+      length(COALESCE(json_extract(e.payload,'$.text'),'')) AS text_length
+      FROM events e LEFT JOIN kv ack ON ack.key='notices.ack:'||e.session_id
+      WHERE e.id>? AND e.seq>CAST(COALESCE(ack.value,'0') AS INTEGER)
+      AND e.type IN ('result','error','permission_request') AND json_valid(e.payload)
+      AND (e.type!='result' OR COALESCE(json_extract(e.payload,'$.isError'),0)
+        OR COALESCE(json_extract(e.payload,'$.numTurns'),-1)!=0
+        OR length(COALESCE(json_extract(e.payload,'$.text'),''))>0)
+      ORDER BY e.id DESC LIMIT 50`).all(Number(this.getKV('notices.since.v1'))) as any[];
+    const notices = rows.map(r => ({id:`${r.session_id}:${r.seq}`,taskId:r.session_id,
+      label:noticeLabel({type:r.type,payload:{isError:r.is_error,numTurns:r.turns,text:r.text_length?'x':''}})!,time:r.created_at}));
+    let legacy: TaskNotice[] = [];
+    try { legacy = JSON.parse(this.getKV('notices.legacy.v1') ?? '[]'); } catch { /* bad old UI data */ }
+    const merged = new Map([...legacy,...notices].map(n => [n.id,n]));
+    return [...merged.values()].sort((a,b)=>b.time.localeCompare(a.time)).slice(0,50);
+  }
+  importTaskNotices(value: unknown) {
+    if (this.getKV('notices.imported.v1')) return;
+    if (!Array.isArray(value)) throw new Error('通知格式无效');
+    const notices = value.slice(0,50).filter((n):n is TaskNotice => n && typeof n.id==='string'
+      && n.id.length<200 && typeof n.taskId==='string' && n.taskId.length<200
+      && typeof n.label==='string' && n.label.length<200 && typeof n.time==='string'
+      && Number.isFinite(Date.parse(n.time)))
+      .map(({id,taskId,label,time})=>({id,taskId,label,time}));
+    this.transaction(()=>{
+      this.setKV('notices.legacy.v1',JSON.stringify(notices));
+      this.setKV('notices.imported.v1','true');
+    });
+  }
+  ackTaskNotices(taskId: string) {
+    if (typeof taskId!=='string' || taskId.length>200) throw new Error('任务标识无效');
+    this.transaction(()=>{
+      this.setKV(`notices.ack:${taskId}`,String(this.lastSeq(taskId)));
+      const legacy: TaskNotice[] = JSON.parse(this.getKV('notices.legacy.v1') ?? '[]');
+      this.setKV('notices.legacy.v1',JSON.stringify(legacy.filter(n=>n.taskId!==taskId)));
+    });
   }
 
   // Only completed main-task turns enter the nightly queue. The cursor is advanced
@@ -267,6 +362,11 @@ export class Store {
   }
 
   // ---- 工具执行守卫：同 key 只执行一次（重放/重复事件安全）----
+  getToolResult(sessionId: string, toolKey: string): any | null | undefined {
+    const row: any = this.ensure().prepare('SELECT result_json FROM executed_tools WHERE session_id=? AND tool_key=?')
+      .get(sessionId, toolKey);
+    return row ? (row.result_json ? JSON.parse(row.result_json) : null) : undefined;
+  }
   firstRun(sessionId: string, toolKey: string): { first: boolean; previous: any | null } {
     const existing: any = this.ensure().prepare('SELECT result_json FROM executed_tools WHERE session_id=? AND tool_key=?')
       .get(sessionId, toolKey);

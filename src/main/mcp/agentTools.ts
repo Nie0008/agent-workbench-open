@@ -87,11 +87,22 @@ export async function createWorkbenchMcpServer(taskService: TaskService, parentS
     },
   );
 
+  const runIsolatedCheck = tool(
+    'run_isolated_check',
+    '运行本任务范围中明确授权的构建/测试命令。命令必须与授权清单完全一致；Workbench 将项目复制到无网络、无宿主凭据的本地容器，记录退出码与结果。普通 Bash 不因此获得宿主执行权限。',
+    { command: z.string().describe('授权清单中的完整命令'),
+      image: z.string().optional().describe('可选。仅申请清单外一次执行时提供本地镜像的完整 sha256 ID') },
+    async (args) => {
+      const r = await taskService.runIsolatedCheck(parentSessionId, args.command, args.image);
+      return text(r, !r.ok);
+    },
+  );
+
   return {
     workbench: createSdkMcpServer({
       name: 'workbench',
       version: '0.1.0',
-      tools: [delegateTask, listSubtasks, readTaskResult, appendTaskMessage, cancelTask, getTaskEvents],
+      tools: [delegateTask, listSubtasks, readTaskResult, appendTaskMessage, cancelTask, getTaskEvents, runIsolatedCheck],
     }),
   };
 }

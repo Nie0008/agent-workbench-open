@@ -1,8 +1,10 @@
 import {projectName} from './project-name';
 import { ProgressPanel } from './progress';
 import { useTaskNotices } from './task-notices';
+import {useWindowState,initializeWindowState,hasRestoredState} from './window-state';
+import {projectSourceDraft,type ModelDraft,type SourceDraft} from './window-drafts';
 // Agent Workbench 主界面：三栏布局（项目/任务 | 主对话 | 文件/差异/子任务）
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { WorkbenchEvent, Project, SessionRow, FileNode, ProviderInfo, ModelProfile, ModelAgentId, Settings, DiffLine, MemoryEntry, MemoryInjectionSnapshot, MemoryKind } from '../shared/types';
 import { Markdownish, StatusDot, STATUS_LABEL, ToolCard, DiffLines, parsePatch } from './ui';
@@ -60,6 +62,11 @@ function buildConv(events: WorkbenchEvent[]): ConvItem[] {
       }
       case 'permission_request':
         flushFiles();
+        // 同一 permissionId 的重复请求（旧版协议重试遗留）合并为一张卡片
+        {
+          const existing = permIdx.get(p.permissionId);
+          if (existing != null && items[existing].t === 'perm') { (items[existing] as any).ev = ev; break; }
+        }
         items.push({ k: `p${ev.seq}`, t: 'perm', ev });
         permIdx.set(p.permissionId, items.length - 1);
         break;
@@ -97,6 +104,10 @@ function buildConv(events: WorkbenchEvent[]): ConvItem[] {
         flushFiles();
         items.push({ k: `n${ev.seq}`, t: 'notice', text: p.text });
         break;
+      case 'scope':
+        flushFiles();
+        items.push({ k: `sc${ev.seq}`, t: 'notice', text: p.text || `授权范围：${JSON.stringify(p.scope)}` });
+        break;
       case 'session': {
         const st = p.status as string;
         if (p.previous && ['stopped', 'canceled', 'timeout', 'interrupted', 'failed', 'completed'].includes(st)) {
@@ -116,36 +127,87 @@ export default function App() {
   const {notices,ack}=useTaskNotices();
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [projectId, setProjectId] = useState<string>('');
+  const [projectId, setProjectId] = useWindowState<string>('app.projectId','');
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [eventsBy, setEventsBy] = useState<Record<string, WorkbenchEvent[]>>({});
   const [streamBy, setStreamBy] = useState<Record<string, string>>({});
-  const [currentMainId, setCurrentMainId] = useState<string>('');
-  const [subViewId, setSubViewId] = useState<string | null>(null);
-  const [rightTab, setRightTab] = useState<'files' | 'diff' | 'subtasks'>('files');
-  const [rightOpen, setRightOpen] = useState(true);
-  const [leftOpen, setLeftOpen] = useState(true);
+  const [currentMainId, setCurrentMainId] = useWindowState<string>('app.currentMainId','');
+  const [subViewId, setSubViewId] = useWindowState<string | null>('app.subViewId',null,(v)=>v===null||typeof v==='string');
+  const [rightTab, setRightTab] = useWindowState<'files' | 'diff' | 'subtasks'>('app.rightTab','files');
+  const [rightOpen, setRightOpen] = useWindowState('app.rightOpen',true);
+  const [leftOpen, setLeftOpen] = useWindowState('app.leftOpen',true);
   const [narrow, setNarrow] = useState(window.innerWidth < 1080);
-  const [rightW, setRightW] = useState(380);
-  const [fileSel, setFileSel] = useState<string | null>(null);
-  const [fileMode, setFileMode] = useState<'read' | 'edit'>('read');
-  const [fileContent, setFileContent] = useState('');
-  const [diffPath, setDiffPath] = useState<string | null>(null);
-  const [newTaskOpen, setNewTaskOpen] = useState(false);
-  const [modelsOpen, setModelsOpen] = useState(false);
-  const [newProjOpen, setNewProjOpen] = useState(false);
-  const [factsOpen, setFactsOpen] = useState(false);
-  const [progressOpen,setProgressOpen]=useState(true);
-  const [bindTarget, setBindTarget] = useState<{ sessionId: string; text: string } | null>(null);
-  const [input, setInput] = useState('');
+  const [rightW, setRightW] = useWindowState('app.rightW',380);
+  const [fileSel, setFileSel] = useWindowState<string | null>('app.fileSel',null,(v)=>v===null||typeof v==='string');
+  const [fileMode, setFileMode] = useWindowState<'read' | 'edit'>('app.fileMode','read');
+  const [fileContent, setFileContent] = useWindowState('app.fileContent','');
+  const [fileSessionId,setFileSessionId]=useWindowState<string|null>('app.fileSessionId',null,(v)=>v===null||typeof v==='string');
+  const fileReadGeneration=useRef(0);
+  const [fileLoading,setFileLoading]=useState(false);
+  const [hideError,setHideError]=useState('');
+  const [diffPath, setDiffPath] = useWindowState<string | null>('app.diffPath',null,(v)=>v===null||typeof v==='string');
+  const [newTaskOpen, setNewTaskOpen] = useWindowState('app.newTaskOpen',false);
+  const [modelsOpen, setModelsOpen] = useWindowState('app.modelsOpen',false);
+  const [newProjOpen, setNewProjOpen] = useWindowState('app.newProjOpen',false);
+  const [factsOpen, setFactsOpen] = useWindowState('app.factsOpen',false);
+  const [progressOpen,setProgressOpen]=useWindowState('app.progressOpen',true);
+  const [windowVisible, setWindowVisible] = useState(!document.hidden);
+  const [documentVisible, setDocumentVisible] = useState(!document.hidden);
+  const [bindTarget, setBindTarget] = useWindowState<{ sessionId: string; text: string } | null>('app.bindTarget',null,(v:any)=>v===null||v&&typeof v.sessionId==='string'&&typeof v.text==='string');
+  const [input, setInput] = useWindowState('app.input','');
   const [sendError, setSendError] = useState('');
-  const [subInput, setSubInput] = useState('');
+  const [subInput, setSubInput] = useWindowState('app.subInput','');
   const [subSendError, setSubSendError] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
   const seqsRef = useRef<Record<string, number>>({});
   const haveRef = useRef<Set<string>>(new Set());
+  const visibleSessionsRef = useRef<Set<string>>(new Set());
+  const loadsRef = useRef<Map<string, { wantedSeq: number; loading: boolean }>>(new Map());
+  const streamsRef = useRef<Record<string, string>>({});
+  const streamFrameRef = useRef<number | null>(null);
   const treeRef = useRef<FileNode | null>(null);
   const [treeVer, setTreeVer] = useState(0);
+
+  const currentMain = sessions.find((s) => s.id === currentMainId) ?? null;
+  const subtasks = useMemo(() => sessions.filter((s) => s.kind === 'sub' && s.parentSessionId === currentMainId), [sessions, currentMainId]);
+  const convSessionId = subViewId ?? currentMainId;
+  const convSession = sessions.find((s) => s.id === convSessionId) ?? null;
+  const panelSub = rightOpen && rightTab === 'subtasks' ? subtasks.find((s) => s.id === subViewId) ?? subtasks[0] : null;
+  const visibleIds = !progressOpen && windowVisible && documentVisible
+    ? [...new Set([convSession, panelSub].filter((s) => s?.projectId === projectId).map((s) => s!.id))]
+    : [];
+  const visibleKey = visibleIds.join(',');
+
+  const flushStreams = useCallback(() => {
+    if (streamFrameRef.current != null) return;
+    streamFrameRef.current = requestAnimationFrame(() => {
+      streamFrameRef.current = null;
+      setStreamBy({ ...streamsRef.current });
+    });
+  }, []);
+
+  const appendEvents = useCallback((sessionId: string, events: WorkbenchEvent[], load?: { wantedSeq: number; loading: boolean }) => {
+    if (!visibleSessionsRef.current.has(sessionId) || (load && loadsRef.current.get(sessionId) !== load)) return;
+    let last = seqsRef.current[sessionId] ?? 0;
+    let stream = streamsRef.current[sessionId] ?? '';
+    const kept: WorkbenchEvent[] = [];
+    for (const event of events) {
+      if (event.seq <= last) continue;
+      last = event.seq;
+      if (event.type === 'text_delta') stream += event.payload.text ?? '';
+      else {
+        kept.push(event);
+        if ((event.type === 'message' && event.payload.role === 'assistant') || event.type === 'result' || event.type === 'error') stream = '';
+      }
+    }
+    seqsRef.current[sessionId] = last;
+    if (kept.length) setEventsBy((m) => visibleSessionsRef.current.has(sessionId) && (!load || loadsRef.current.get(sessionId) === load)
+      ? { ...m, [sessionId]: [...(m[sessionId] ?? []), ...kept] } : m);
+    if (streamsRef.current[sessionId] !== stream) {
+      streamsRef.current[sessionId] = stream;
+      flushStreams();
+    }
+  }, [flushStreams]);
 
   const loadProjects = useCallback(async () => {
     const r = await api('projects.list');
@@ -167,17 +229,41 @@ export default function App() {
     }
   }, []);
 
-  const ensureEvents = useCallback(async (sessionId: string) => {
-    const since = seqsRef.current[sessionId] ?? 0;
-    if (since > 0 && haveRef.current.has(sessionId)) return;
-    const r = await api('events.list', { sessionId, sinceSeq: 0 });
-    if (r.ok) {
-      const evs: WorkbenchEvent[] = r.data;
-      setEventsBy((m) => ({ ...m, [sessionId]: evs }));
-      seqsRef.current[sessionId] = evs.length ? evs[evs.length - 1].seq : 0;
-      haveRef.current.add(sessionId);
-    }
-  }, []);
+  const ensureEvents = useCallback(async (sessionId: string, wantedSeq = 0) => {
+    if (!visibleSessionsRef.current.has(sessionId)) return;
+    let load = loadsRef.current.get(sessionId);
+    if (!load) { load = { wantedSeq, loading: false }; loadsRef.current.set(sessionId, load); }
+    load.wantedSeq = Math.max(load.wantedSeq, wantedSeq);
+    if (load.loading || haveRef.current.has(sessionId)) return;
+    load.loading = true;
+    try {
+      // ponytail: the visible conversation keeps its full history; paginate the UI only if that history becomes the measured bottleneck.
+      while (visibleSessionsRef.current.has(sessionId) && loadsRef.current.get(sessionId) === load) {
+        const since = seqsRef.current[sessionId] ?? 0;
+        const r = await api('events.list', { sessionId, sinceSeq: since });
+        if (!visibleSessionsRef.current.has(sessionId) || loadsRef.current.get(sessionId) !== load || !r.ok) return;
+        const evs: WorkbenchEvent[] = r.data;
+        appendEvents(sessionId, evs, load);
+        const cursor = seqsRef.current[sessionId] ?? 0;
+        if (evs.length < 2000 && cursor >= load.wantedSeq) { haveRef.current.add(sessionId); return; }
+        if (cursor <= since) return; // A failed/incomplete replay must not spin or mark a missing live event as loaded.
+      }
+    } catch { /* A later visible event can retry; old views must never be repopulated. */ }
+    finally { load.loading = false; }
+  }, [appendEvents]);
+
+  useLayoutEffect(() => {
+    const visible = new Set(visibleKey ? visibleKey.split(',') : []);
+    visibleSessionsRef.current = visible;
+    for (const id of Object.keys(seqsRef.current)) if (!visible.has(id)) delete seqsRef.current[id];
+    for (const id of haveRef.current) if (!visible.has(id)) haveRef.current.delete(id);
+    for (const id of loadsRef.current.keys()) if (!visible.has(id)) loadsRef.current.delete(id);
+    for (const id of Object.keys(streamsRef.current)) if (!visible.has(id)) delete streamsRef.current[id];
+    if (streamFrameRef.current != null) { cancelAnimationFrame(streamFrameRef.current); streamFrameRef.current = null; }
+    setEventsBy((m) => Object.fromEntries(Object.entries(m).filter(([id]) => visible.has(id))));
+    setStreamBy({ ...streamsRef.current });
+    for (const id of visible) void ensureEvents(id);
+  }, [visibleKey, ensureEvents]);
 
   useEffect(() => {
     (async () => {
@@ -185,53 +271,67 @@ export default function App() {
       if (r.ok) setInfo(r.data);
       await loadProjects();
     })();
+  }, [loadProjects]);
+
+  useEffect(() => {
     const unsub = wb.onEvent((e: WorkbenchEvent) => {
+      if (e.type === 'session' || e.type === 'result' || e.type === 'task_delegated') {
+        api('sessions.list', { projectId }).then((r2: any) => { if (r2.ok) setSessions(r2.data); });
+      }
+      if (!visibleSessionsRef.current.has(e.sessionId)) return;
       const last = seqsRef.current[e.sessionId] ?? 0;
-      if (e.seq <= last) return;   // 客户端去重
-      if (haveRef.current.has(e.sessionId) && e.seq > last + 1) {
-        // 序号缺口（初始化竞态）：重拉全量
+      if (e.seq <= last) return;
+      const load = loadsRef.current.get(e.sessionId);
+      if (load?.loading || !haveRef.current.has(e.sessionId) || e.seq > last + 1) {
+        // Loading and sequence gaps replay from the last contiguous cursor, never from the first page again.
         haveRef.current.delete(e.sessionId);
-        seqsRef.current[e.sessionId] = 0;
-        void ensureEvents(e.sessionId);
+        void ensureEvents(e.sessionId, e.seq);
         return;
       }
-      seqsRef.current[e.sessionId] = e.seq;
-      setEventsBy((m) => ({ ...m, [e.sessionId]: [...(m[e.sessionId] ?? []), e] }));
-      if (e.type === 'text_delta') setStreamBy((m) => ({ ...m, [e.sessionId]: (m[e.sessionId] ?? '') + e.payload.text }));
-      if (e.type === 'message' && e.payload.role === 'assistant') setStreamBy((m) => ({ ...m, [e.sessionId]: '' }));
-      if (e.type === 'session' || e.type === 'result') {
-        api('sessions.list', { projectId }).then((r2: any) => { if (r2.ok) setSessions(r2.data); });
-      }
-      if (e.type === 'task_delegated') {
-        api('sessions.list', { projectId }).then((r2: any) => { if (r2.ok) setSessions(r2.data); });
-      }
+      appendEvents(e.sessionId, [e], load);
     });
     const onResize = () => { setNarrow(window.innerWidth < 1080); if (window.innerWidth >= 1080) { setLeftOpen(true); setRightOpen(true); } };
     window.addEventListener('resize', onResize);
-    return () => { unsub(); window.removeEventListener('resize', onResize); };
-  }, [loadProjects, projectId]);
+    // 系统通知/菜单栏点击 → 打开对应任务（深度链接）。关闭看板覆盖层以露出工作区定位。
+    const unsubOpen = typeof wb.onOpenTask === 'function' ? wb.onOpenTask((taskId: string) => {
+      void (async () => {
+        const r = await api('session.get', { sessionId: taskId });
+        if (!r.ok) return;
+        const s: SessionRow = r.data;
+        setProgressOpen(false);
+        if (s.projectId) setProjectId(s.projectId);
+        if (s.kind === 'main') { setSubViewId(null); setCurrentMainId(s.id); }
+        else setSubViewId(s.id);
+      })();
+    }) : null;
+    return () => { unsub(); window.removeEventListener('resize', onResize); unsubOpen?.(); };
+  }, [projectId, ensureEvents, appendEvents]);
+
+  useEffect(() => {
+    let alive = true, visibilityEvents = 0;
+    const off = wb.onWindowVisibility((visible: boolean) => { visibilityEvents++; setWindowVisible(visible); });
+    void api('app.windowState').then((r: any) => { if (alive && visibilityEvents === 0 && r.ok) setWindowVisible(r.data.visible); });
+    const changed = () => setDocumentVisible(!document.hidden);
+    document.addEventListener('visibilitychange', changed);
+    return () => {
+      alive = false; off(); document.removeEventListener('visibilitychange', changed);
+      visibleSessionsRef.current.clear(); loadsRef.current.clear();
+      if (streamFrameRef.current != null) cancelAnimationFrame(streamFrameRef.current);
+    };
+  }, []);
 
   useEffect(() => { if (projectId) loadSessions(projectId); }, [projectId, loadSessions]);
-  useEffect(() => {
-    if (currentMainId) ensureEvents(currentMainId);
-    if (subViewId) ensureEvents(subViewId);
-  }, [currentMainId, subViewId, ensureEvents]);
-
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [eventsBy, streamBy, subViewId, currentMainId]);
 
-  const currentMain = sessions.find((s) => s.id === currentMainId) ?? null;
-  const subtasks = useMemo(() => sessions.filter((s) => s.kind === 'sub' && s.parentSessionId === currentMainId), [sessions, currentMainId]);
-  const convSessionId = subViewId ?? currentMainId;
-  const convSession = sessions.find((s) => s.id === convSessionId) ?? null;
   const convEvents = eventsBy[convSessionId] ?? [];
   const conv = useMemo(() => buildConv(convEvents), [convEvents]);
   const streamText = streamBy[convSessionId] ?? '';
 
-  const sendInput = async (overrideText?: string) => {
+  const sendInput = async (overrideText?: string, targetSessionId?: string) => {
     const text = (overrideText ?? input).trim();
-    const targetId = selectedSessionId(subViewId, currentMainId);
+    const targetId = targetSessionId ?? selectedSessionId(subViewId, currentMainId);
     if (!text || !targetId) return;
     setSendError('');
     const r = await api('task.send', { sessionId: targetId, text, clientMsgId: `ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` });
@@ -268,13 +368,17 @@ export default function App() {
   useEffect(() => { loadTree(); }, [loadTree, convSession?.cwd]);
 
   const openFile = async (path: string) => {
-    setFileSel(path); setFileMode('read'); setRightOpen(true); setRightTab('files');
-    const r = await api('files.read', { sessionId: convSessionId, path });
-    setFileContent(r.ok ? r.data.content : `读取失败: ${r.error}`);
+    const generation=++fileReadGeneration.current;
+    setFileLoading(true);setFileContent('');
+    setFileSessionId(convSessionId); setFileSel(path); setFileMode('read'); setRightOpen(true); setRightTab('files');
+    try {
+      const r = await api('files.read', { sessionId: convSessionId, path });
+      if(generation===fileReadGeneration.current)setFileContent(r.ok ? r.data.content : `读取失败: ${r.error}`);
+    } finally { if(generation===fileReadGeneration.current)setFileLoading(false); }
   };
   const saveFile = async () => {
-    if (!fileSel) return;
-    const r = await api('files.write', { sessionId: convSessionId, path: fileSel, content: fileContent });
+    if (!fileSel || !fileSessionId || fileLoading) return;
+    const r = await api('files.write', { sessionId: fileSessionId, path: fileSel, content: fileContent });
     if (!r.ok) alert(`保存失败: ${r.error}`);
     loadTree();
   };
@@ -313,10 +417,11 @@ export default function App() {
         {!progressOpen && convSession && !narrow && <button className={`ghost-btn ${rightOpen ? 'on' : ''}`} onClick={() => setRightOpen(!rightOpen)}>{rightOpen ? '收起面板' : '展开面板'}</button>}
         <button className="ghost-btn" onClick={() => setProgressOpen(true)}>任务看板{notices.length ? ` · ${notices.length} 条新动态` : ''}</button>
         <button className="ghost-btn" onClick={() => setModelsOpen(true)}>模型配置</button>
-        <button className="ghost-btn" onClick={() => { void api('app.hide').then((r: any) => { if (!r.ok) window.alert(r.error); }); }}>收起到菜单栏</button>
+        <button className="ghost-btn" onClick={() => { void api('app.hide').then((r: any) => { if (!r.ok) setHideError(r.error); }); }}>收起到菜单栏</button>
         <button className="ghost-btn" onClick={() => setFactsOpen(true)}>项目背景</button>
       </div>
 
+      {hideError && <div role="alert" className="notice">{hideError}</div>}
       <div className={`layout ${narrow ? 'narrow' : ''} ${rightOpen ? '' : 'right-closed'}`}>
         {/* 左栏 */}
         <div className={`left ${narrow && leftOpen ? 'narrow-overlay' : ''}`} style={narrow && !leftOpen ? { display: 'none' } : undefined}>
@@ -331,7 +436,7 @@ export default function App() {
             {sessions.filter((s) => s.kind === 'main').length === 0 && <div className="hint">还没有任务。点击「新建任务」开始。</div>}
             {sessions.filter((s) => s.kind === 'main').map((s) => (
               <React.Fragment key={s.id}>
-                <div className={`task-item ${s.id === currentMainId ? 'active' : ''}`} onClick={() => { setCurrentMainId(s.id); setSubViewId(null); ensureEvents(s.id); }}>
+                <div className={`task-item ${s.id === currentMainId ? 'active' : ''}`} onClick={() => { setCurrentMainId(s.id); setSubViewId(null); }}>
                   <div className="t-row">
                     <StatusDot status={s.status} />
                     <span className="t-title">{s.title}</span>
@@ -340,7 +445,7 @@ export default function App() {
                 </div>
                 {sessions.filter((x) => x.kind === 'sub' && x.parentSessionId === s.id).map((sub) => (
                   <div key={sub.id} className={`task-item sub ${sub.id === subViewId ? 'active' : ''}`}
-                    onClick={() => { setCurrentMainId(s.id); setSubViewId(sub.id); setRightTab('subtasks'); setRightOpen(true); ensureEvents(sub.id); }}>
+                    onClick={() => { setCurrentMainId(s.id); setSubViewId(sub.id); setRightTab('subtasks'); setRightOpen(true); }}>
                     <div className="t-row">
                       <StatusDot status={sub.status} />
                       <span className="t-title">↳ {sub.title}</span>
@@ -353,7 +458,10 @@ export default function App() {
           </div>
           <div style={{ padding: 10, borderTop: '1px solid var(--border)', display: 'flex', gap: 8 }}>
             <button className="btn small" style={{ flex: 1 }} onClick={() => setNewProjOpen(true)}>新建项目</button>
-            <button className="btn small" onClick={async () => { await loadProjects(); if (projectId) await loadSessions(projectId); }}>刷新</button>
+            <button className="btn small" onClick={async () => {
+              await loadProjects(); if (projectId) await loadSessions(projectId);
+              for (const id of visibleSessionsRef.current) { haveRef.current.delete(id); void ensureEvents(id); }
+            }}>刷新</button>
           </div>
         </div>
 
@@ -438,7 +546,7 @@ export default function App() {
                     <div className="viewer-head">
                       <span className="path">{fileSel}</span>
                       <button className="btn small" onClick={() => openDiff(fileSel)}>差异</button>
-                      {fileMode === 'read' ? <button className="btn small" onClick={() => setFileMode('edit')}>编辑</button> : <button className="btn small primary" onClick={saveFile}>保存</button>}
+                      {fileMode === 'read' ? <button className="btn small" disabled={fileLoading} onClick={() => setFileMode('edit')}>编辑</button> : <button className="btn small primary" disabled={fileLoading} onClick={saveFile}>保存</button>}
                       <button className="btn small" onClick={() => setFileSel(null)}>关闭</button>
                     </div>
                     {fileMode === 'edit'
@@ -465,15 +573,15 @@ export default function App() {
       </div>
 
       {!progressOpen && notices.length>0 && <div className="task-notice-banner" role="status"><span>{notices[0].label} · {notices.length} 条新动态</span><button className="btn" onClick={()=>setProgressOpen(true)}>打开看板查看</button></div>}
-      {progressOpen && <ProgressPanel notices={notices} ack={ack} onClose={()=>setProgressOpen(false)} onOpen={t=>{setProjectId(t.projectId);setCurrentMainId(t.parentTaskId??t.taskId);setSubViewId(t.parentTaskId?t.taskId:null);ensureEvents(t.taskId);setProgressOpen(false);}} />}
-      {newTaskOpen && <NewTaskModal info={info} projectId={projectId} onClose={() => setNewTaskOpen(false)} onCreated={(id) => { setNewTaskOpen(false); loadSessions(projectId); setCurrentMainId(id); setSubViewId(null); }} />}
+      {progressOpen && <ProgressPanel notices={notices} ack={ack} onClose={()=>setProgressOpen(false)} onOpen={t=>{setProjectId(t.projectId);setCurrentMainId(t.parentTaskId??t.taskId);setSubViewId(t.parentTaskId?t.taskId:null);setProgressOpen(false);}} />}
+      {newTaskOpen && <NewTaskModal info={info} projectId={projectId} onClose={() => setNewTaskOpen(false)} onCreated={async (id) => { setNewTaskOpen(false); const r=await api('session.get',{sessionId:id}); if(r.ok){setProjectId(r.data.projectId);loadSessions(r.data.projectId);} setCurrentMainId(id); setSubViewId(null); }} />}
       {modelsOpen && <ModelManagerModal info={info} onClose={async () => { setModelsOpen(false); const r = await api('app.info'); if (r.ok) setInfo(r.data); }} />}
       {newProjOpen && <NewProjectModal onClose={() => setNewProjOpen(false)} onCreated={async (id) => { setNewProjOpen(false); await loadProjects(); setProjectId(id); }} />}
       {factsOpen && projectId && <FactsModal projectId={projectId} taskId={subViewId ?? currentMainId} onClose={() => setFactsOpen(false)} />}
-      {bindTarget && <BindProviderModal info={info} sessionId={bindTarget.sessionId} onClose={() => setBindTarget(null)} onBound={async () => {
+      {bindTarget && <BindProviderModal key={bindTarget.sessionId} info={info} sessionId={bindTarget.sessionId} onClose={() => setBindTarget(null)} onBound={async () => {
         const t = bindTarget; setBindTarget(null);
         await loadSessions(projectId);
-        if (t) void sendInput(t.text);
+        if (t) void sendInput(t.text,t.sessionId);
       }} />}
     </>
   );
@@ -493,13 +601,18 @@ function ConvItemView({ item, onOpenFile, openFileRead }: { item: ConvItem; onOp
     case 'perm': {
       const pending = !item.resolved;
       const decision = item.resolved?.payload.decision;
+      const invalidated = decision === 'invalidated';
+      const reason = item.ev.payload.reason;
       return (
         <div className={`card ${pending ? 'perm-card' : ''}`}>
           <div className="card-head" style={{ cursor: 'default' }}>
             <span>🔐 授权请求</span>
             <span className="tool-name">{item.ev.payload.toolName}</span>
-            <span className="tool-state">{pending ? '等待你的决定' : decision === 'allow' ? '已允许' : '已拒绝'}</span>
+            <span className="tool-state">{pending ? '等待你的决定'
+              : invalidated ? '已失效（需恢复任务后重试）'
+              : decision === 'allow' ? '已允许' : '已拒绝'}</span>
           </div>
+          {reason && <div className="notice" style={{ margin: '0 12px' }}>为何需要授权：{reason}</div>}
           <div className="card-body"><div className="tool-input">{JSON.stringify(item.ev.payload.input, null, 2)}</div></div>
           {pending && <PermActions permissionId={item.ev.payload.permissionId} />}
         </div>
@@ -554,15 +667,23 @@ function ConvItemView({ item, onOpenFile, openFileRead }: { item: ConvItem; onOp
 
 function PermActions({ permissionId }: { permissionId: string }) {
   const [done, setDone] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const act = async (decision: 'allow' | 'deny') => {
-    setDone(decision);
-    await api('permissions.respond', { permissionId, decision });
+    setBusy(true);
+    setError(null);
+    const r = await api('permissions.respond', { permissionId, decision });
+    setBusy(false);
+    // 服务端结果权威：已处理/不存在时明确提示并保持可重试，不把按钮永久锁死
+    if (r?.ok) setDone(decision);
+    else setError(String(r?.error ?? '授权请求已处理或不存在，请刷新查看最新状态'));
   };
   return (
     <div className="perm-actions">
-      <button className="btn primary" disabled={!!done} onClick={() => act('allow')}>允许</button>
-      <button className="btn danger" disabled={!!done} onClick={() => act('deny')}>拒绝</button>
-      <span style={{ fontSize: 11, color: 'var(--text-faint)', alignSelf: 'center' }}>拒绝后对应工具不会执行</span>
+      <button className="btn primary" disabled={!!done || busy} onClick={() => act('allow')}>允许</button>
+      <button className="btn danger" disabled={!!done || busy} onClick={() => act('deny')}>拒绝</button>
+      {done && <span style={{ fontSize: 11, color: 'var(--text-faint)', alignSelf: 'center' }}>已{done === 'allow' ? '允许' : '拒绝'}</span>}
+      {error && <span style={{ fontSize: 11, color: 'var(--danger, #e07070)', alignSelf: 'center' }}>{error}</span>}
     </div>
   );
 }
@@ -696,15 +817,14 @@ function SubTasksPanel({ subtasks, subViewId, setSubViewId, eventsBy, subInput, 
   );
 }
 
-type ModelDraft = Omit<ModelProfile, 'id' | 'sourceFingerprint'> & { id?: string };
 const MODEL_AGENT_IDS: ModelAgentId[] = ['claude-code', 'grok', 'dsh', 'zcode'];
 
-function ModelManagerModal({ info, onClose }: { info: AppInfo | null; onClose: () => void }) {
+function ModelManagerModal({ info, onClose, stateKey='models' }: { info: AppInfo | null; onClose: () => void; stateKey?: string }) {
   const [catalog, setCatalog] = useState(info);
-  const [draft, setDraft] = useState<ModelDraft | null>(null);
-  const [sourceDraft, setSourceDraft] = useState<{
-    providerId?: string; name: string; baseUrl: string; model: string; apiKey: string; authMode: 'api_key' | 'auth_token'
-  } | null>(null);
+  const [draft, setDraft] = useWindowState<ModelDraft | null>(`${stateKey}.draft`,null,(v:any)=>v===null||v&&typeof v.name==='string'&&typeof v.model==='string'&&typeof v.providerId==='string'&&Array.isArray(v.agents));
+  const [sourceDraft, setSourceDraft] = useWindowState<SourceDraft | null>(`${stateKey}.sourceDraft`,null,(v)=>v===null||projectSourceDraft(v)!==null);
+  // The API key belongs only to this renderer; it is never registered with useWindowState.
+  const [sourceApiKey, setSourceApiKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
   const refresh = async () => {
@@ -757,9 +877,9 @@ function ModelManagerModal({ info, onClose }: { info: AppInfo | null; onClose: (
   const saveSource = async () => {
     if (!sourceDraft || busy) return;
     setBusy(true);
-    const result = await api('credentials.save', sourceDraft);
+    const result = await api('credentials.save', { ...sourceDraft, apiKey: sourceApiKey });
     setBusy(false);
-    setSourceDraft((old) => old ? { ...old, apiKey: '' } : null);
+    setSourceApiKey('');
     if (!result.ok) { setNotice(result.error ?? '保存凭据失败'); return; }
     setSourceDraft(null);
     setNotice('本地凭据来源已保存，模型已加入目录。');
@@ -789,11 +909,12 @@ function ModelManagerModal({ info, onClose }: { info: AppInfo | null; onClose: (
   return <div className="modal-mask" onClick={onClose}>
     <div className="modal model-manager" onClick={(e) => e.stopPropagation()}>
       <h3>模型配置</h3>
-      <div className="combo-note">可直接添加 API key，或从 CC Switch 复制到 Workbench。复制后新任务可使用本地凭据；已有任务保留原绑定。本地 key 经 macOS 系统安全存储加密，界面不回显。</div>
+      <div className="combo-note">可直接添加 API key，或从 CC Switch 复制到 Workbench。复制后新任务可使用本地凭据；已有任务保留原绑定。本地 key 经系统安全存储加密，界面不回显。</div>
       <div className="model-manager-actions">
-        <button className="btn" onClick={() => { setSourceDraft({ name:'', baseUrl:'', model:'', apiKey:'', authMode:'api_key' }); setNotice(''); }}>＋ 添加 API 凭据</button>
+        <button className="btn" onClick={() => { setSourceDraft({ name:'', baseUrl:'', model:'', authMode:'api_key' }); setSourceApiKey(''); setNotice(''); }}>＋ 添加 API 凭据</button>
       </div>
       {(catalog?.sources ?? []).filter((item) => !item.providerId.startsWith('workbench-local:')
+        && !item.providerId.startsWith('native:')
         && item.providerId !== 'grok-super-oauth' && !item.providerId.startsWith('grok-config:')).map((item) => {
         const copied = catalog?.sources.some((source) => source.importedFromCcSwitchId === item.providerId);
         return <div className="model-manager-row" key={item.providerId}>
@@ -804,7 +925,7 @@ function ModelManagerModal({ info, onClose }: { info: AppInfo | null; onClose: (
       {(catalog?.sources ?? []).filter((item) => item.providerId.startsWith('workbench-local:')).map((item) =>
         <div className="model-manager-row" key={item.providerId}>
           <div><strong>{item.name}</strong><span className="model-manager-detail">{item.model} · {item.baseUrl}</span></div>
-          <div><button className="btn small" onClick={() => setSourceDraft({ ...item, apiKey:'', authMode:item.authMode ?? 'api_key' })}>编辑</button>{' '}
+          <div><button className="btn small" onClick={() => { setSourceDraft(projectSourceDraft({ ...item, authMode:item.authMode ?? 'api_key' })); setSourceApiKey(''); }}>编辑</button>{' '}
             <button className="btn small danger" disabled={busy} onClick={() => void deleteSource(item.providerId)}>删除</button></div>
         </div>)}
       {sourceDraft && <div className="model-manager-form">
@@ -821,8 +942,9 @@ function ModelManagerModal({ info, onClose }: { info: AppInfo | null; onClose: (
           <option value="auth_token">代理令牌（ANTHROPIC_AUTH_TOKEN）</option>
         </select>
         <label>API key{sourceDraft.providerId ? '（留空则保留原 key）' : ''}</label>
-        <input type="password" autoComplete="new-password" value={sourceDraft.apiKey} onChange={(e) => setSourceDraft({ ...sourceDraft, apiKey:e.target.value })} />
-        <div className="foot"><button className="btn" onClick={() => setSourceDraft(null)}>取消</button>
+        <input type="password" autoComplete="new-password" value={sourceApiKey} onChange={(e) => setSourceApiKey(e.target.value)} />
+        <div className="combo-note">尚未保存的 API key 只保留在当前窗口；收起后需重新输入。</div>
+        <div className="foot"><button className="btn" onClick={() => { setSourceDraft(null); setSourceApiKey(''); }}>取消</button>
           <button className="btn primary" disabled={busy} onClick={() => void saveSource()}>保存凭据</button></div>
       </div>}
       <div className="model-manager-actions">
@@ -845,7 +967,7 @@ function ModelManagerModal({ info, onClose }: { info: AppInfo | null; onClose: (
         <input type="text" value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} placeholder="例如 GLM 5.3 Flash" />
         <label>凭据来源</label>
         <select value={draft.providerId} onChange={(e) => selectSource(e.target.value)}>
-          {(catalog?.sources ?? []).map((item) => <option key={item.providerId} value={item.providerId}>{item.name}（{item.providerId === 'grok-super-oauth' || item.providerId.startsWith('grok-config:') ? 'Grok' : item.providerId.startsWith('workbench-local:') ? 'Workbench' : 'CC Switch'}）</option>)}
+          {(catalog?.sources ?? []).map((item) => <option key={item.providerId} value={item.providerId}>{item.name}（{item.providerId === 'grok-super-oauth' || item.providerId.startsWith('grok-config:') ? 'Grok' : item.providerId.startsWith('workbench-local:') ? 'Workbench' : item.providerId.startsWith('native:') ? '本机' : 'CC Switch'}）</option>)}
         </select>
         <label>模型 ID</label>
         <input type="text" value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} placeholder="例如 glm-5.3-flash" />
@@ -866,19 +988,25 @@ function ModelManagerModal({ info, onClose }: { info: AppInfo | null; onClose: (
   </div>;
 }
 
-function NewTaskModal({ info, projectId, onClose, onCreated }: { info: AppInfo | null; projectId: string; onClose: () => void; onCreated: (id: string) => void }) {
-  const [title, setTitle] = useState('');
-  const [prompt, setPrompt] = useState('');
-  const [fileWrite, setFileWrite] = useState(false);
+function NewTaskModal({ info, projectId: initialProjectId, onClose, onCreated }: { info: AppInfo | null; projectId: string; onClose: () => void; onCreated: (id: string) => void }) {
+  const [projectId]=useWindowState('newTask.projectId',initialProjectId);
+  const restoredSelection=useRef(hasRestoredState('newTask.agentId')).current;
+  const [title, setTitle] = useWindowState('newTask.title','');
+  const [prompt, setPrompt] = useWindowState('newTask.prompt','');
+  const [fileWrite, setFileWrite] = useWindowState('newTask.fileWrite',false);
+  const [bashMode, setBashMode] = useWindowState<'none' | 'readonly'>('newTask.bashMode','none');
+  const [network, setNetwork] = useWindowState('newTask.network',false);
+  const [checkImage, setCheckImage] = useWindowState('newTask.checkImage','');
+  const [checkCommands, setCheckCommands] = useWindowState('newTask.checkCommands','');
   const [optionsInfo, setOptionsInfo] = useState(info);
-  const [providerId, setProviderId] = useState(info?.defaultTaskCombo?.providerId ?? info?.defaultProviderId ?? '');
-  const [agentId, setAgentId] = useState(info?.defaultTaskCombo?.agentId ?? 'claude-code');
-  const [model, setModel] = useState(info?.defaultTaskCombo?.model ?? '');
+  const [providerId, setProviderId] = useWindowState('newTask.providerId',info?.defaultTaskCombo?.providerId ?? info?.defaultProviderId ?? '');
+  const [agentId, setAgentId] = useWindowState('newTask.agentId',info?.defaultTaskCombo?.agentId ?? 'claude-code');
+  const [model, setModel] = useWindowState('newTask.model',info?.defaultTaskCombo?.model ?? '');
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState('');
   const [defaultNotice, setDefaultNotice] = useState('');
-  const [modelManagerOpen, setModelManagerOpen] = useState(false);
+  const [modelManagerOpen, setModelManagerOpen] = useWindowState('newTask.modelManagerOpen',false);
   const refreshModels = useCallback(async (adoptDefault = false) => {
     setRefreshing(true);
     try {
@@ -897,14 +1025,19 @@ function NewTaskModal({ info, projectId, onClose, onCreated }: { info: AppInfo |
       setRefreshError(error instanceof Error ? error.message : '模型列表刷新失败');
     } finally { setRefreshing(false); }
   }, []);
-  useEffect(() => { void refreshModels(true); }, [refreshModels]);
+  useEffect(() => { void refreshModels(!restoredSelection); }, [refreshModels]);
   const choices = (optionsInfo?.combinations ?? []).flatMap((combo) => {
     const adapter = optionsInfo?.adapters.find((item) => item.id === combo.agentId);
     const provider = optionsInfo?.providers.find((item) => item.profileId === combo.profileId);
     return adapter && provider ? [{ adapter, provider }] : [];
   });
   const selected = choices.find(({ adapter, provider }) => adapter.id === agentId
-    && provider.providerId === providerId && provider.model === model) ?? choices[0];
+    && provider.providerId === providerId && provider.model === model) ?? (restoredSelection ? undefined : choices[0]);
+  useEffect(()=>{
+    if(!restoredSelection && !model && selected){
+      setAgentId(selected.adapter.id);setProviderId(selected.provider.providerId);setModel(selected.provider.model);
+    }
+  },[selected?.provider.profileId,model,restoredSelection]);
   const saveDefault = async () => {
     if (!selected) return;
     const result = await api('agents.setDefault', {
@@ -917,7 +1050,11 @@ function NewTaskModal({ info, projectId, onClose, onCreated }: { info: AppInfo |
     if (!title.trim() || !prompt.trim() || !selected || busy) return;
     setBusy(true);
     const r = await api('sessions.create', {
-      projectId, title: title.trim(), prompt: prompt.trim(), fileWrite,
+      projectId, title: title.trim(), prompt: prompt.trim(),
+      scope: { fileWrite, bash: bashMode, network,
+        ...(checkImage.trim() || checkCommands.trim() ? { isolatedChecks: {
+          image: checkImage.trim(), commands: checkCommands.split('\n').map((line) => line.trim()).filter(Boolean),
+        } } : {}) },
       agentId: selected.adapter.id, model: selected.provider.model, providerId: selected.provider.providerId,
     });
     setBusy(false);
@@ -936,6 +1073,18 @@ function NewTaskModal({ info, projectId, onClose, onCreated }: { info: AppInfo |
           <input type="checkbox" checked={fileWrite} onChange={(e) => setFileWrite(e.target.checked)} id="fw" />
           <label htmlFor="fw" style={{ margin: 0 }}>允许在项目目录内写文件（其他操作按具体请求授权）</label>
         </div>
+        <label>Bash 授权</label>
+        <select value={bashMode} onChange={(e) => setBashMode(e.target.value as 'none' | 'readonly')}>
+          <option value="none">逐条请求确认（最严格）</option>
+          <option value="readonly">仅固定项目读取/文件 SHA-256 命令自动放行</option>
+        </select>
+        <div className="checkline">
+          <input type="checkbox" checked={network} onChange={(e) => setNetwork(e.target.checked)} id="nw" />
+          <label htmlFor="nw" style={{ margin: 0 }}>允许网络工具（WebFetch / WebSearch）</label>
+        </div>
+        <label>隔离构建/测试（可选；仅 Claude Code）</label>
+        <input type="text" value={checkImage} onChange={(e) => setCheckImage(e.target.value)} placeholder="本地 Docker 镜像 ID：sha256:…" />
+        <textarea value={checkCommands} onChange={(e) => setCheckCommands(e.target.value)} placeholder="每行一条明确授权的命令，例如 python -m unittest discover -v" />
         <label>Agent / 模型组合</label>
         <select value={selected ? `${selected.adapter.id}|${selected.provider.profileId}` : ''} onChange={(e) => {
           const choice = choices.find(({ adapter, provider }) => `${adapter.id}|${provider.profileId}` === e.target.value);
@@ -954,20 +1103,20 @@ function NewTaskModal({ info, projectId, onClose, onCreated }: { info: AppInfo |
         {!selected && <div className="combo-note">暂无可用 Agent 与模型组合。</div>}
         {selected?.provider.providerId === 'grok-super-oauth' && <div className="combo-note">Grok Build 使用本机 Grok Super 登录；当前任务固定使用 Grok 模型。</div>}
         {selected?.provider.providerId.startsWith('grok-config:') && <div className="combo-note">此模型已保存在 Workbench 模型目录中，并引用 Grok Build 当前配置。</div>}
-        {selected && ['grok', 'dsh', 'zcode'].includes(selected.adapter.id) && selected.provider.providerId !== 'grok-super-oauth' && !selected.provider.providerId.startsWith('grok-config:') && <div className="combo-note">此组合使用所选 CC Switch 凭据；需要授权时在任务详情中逐项处理。</div>}
-        <div className="combo-note">凭据留在本机 Grok 或 CC Switch 配置中，不写入 Workbench 任务记录。</div>
+        {selected && ['grok', 'dsh', 'zcode'].includes(selected.adapter.id) && selected.provider.providerId !== 'grok-super-oauth' && !selected.provider.providerId.startsWith('grok-config:') && <div className="combo-note">此组合使用所选来源的凭据；需要授权时在任务详情中逐项处理。</div>}
+        <div className="combo-note">凭据保存在本机配置或 Workbench 加密保险库中，不写入任务记录。</div>
         <div className="foot">
           <button className="btn" onClick={onClose}>取消</button>
           <button className="btn primary" disabled={!title.trim() || !prompt.trim() || !selected || busy} onClick={submit}>{busy ? '创建中…' : '创建并开始'}</button>
         </div>
       </div>
     </div>
-    {modelManagerOpen && <ModelManagerModal info={optionsInfo} onClose={() => { setModelManagerOpen(false); void refreshModels(false); }} />}
+    {modelManagerOpen && <ModelManagerModal stateKey="newTask.models" info={optionsInfo} onClose={() => { setModelManagerOpen(false); void refreshModels(false); }} />}
   </>);
 }
 
 function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreated: (id: string) => void }) {
-  const [rootPath, setRootPath] = useState('');
+  const [rootPath, setRootPath] = useWindowState('newProject.rootPath','');
   const [busy, setBusy] = useState(false);
   const submit = async () => {
     if (!rootPath.trim() || busy) return;
@@ -1010,28 +1159,31 @@ function TaskMemoryUsed({ taskId, refreshKey }: { taskId: string; refreshKey: nu
   </details>;
 }
 
-function FactsModal({ projectId, taskId, onClose }: { projectId: string; taskId: string; onClose: () => void }) {
-  const [facts,setFacts] = useState('');
+function FactsModal({ projectId: initialProjectId, taskId: initialTaskId, onClose }: { projectId: string; taskId: string; onClose: () => void }) {
+  const [projectId]=useWindowState('facts.projectId',initialProjectId);
+  const [taskId]=useWindowState('facts.taskId',initialTaskId);
+  const keepRestoredBackground=useRef(hasRestoredState(`facts:${projectId}.facts`));
+  const [facts,setFacts] = useWindowState(`facts:${projectId}.facts`,'');
   const [nightly,setNightly] = useState<{lastCompletedAt:string|null;processedTurns:number;newDrafts:number;error:string|null}|null>(null);
-  const [version,setVersion] = useState<number|null>(null);
+  const [version,setVersion] = useWindowState<number|null>(`facts:${projectId}.version`,null,(v)=>v===null||typeof v==='number'&&Number.isFinite(v));
   const [entries,setEntries] = useState<MemoryEntry[]>([]);
   const [matches,setMatches] = useState<MemoryEntry[]>([]);
   const [matchedBy,setMatchedBy] = useState<Record<string,string[]>>({});
-  const [selected,setSelected] = useState<MemoryEntry|null>(null);
-  const [query,setQuery] = useState('');
-  const [kind,setKind] = useState<MemoryKind>('lesson');
-  const [title,setTitle] = useState('');
-  const [body,setBody] = useState('');
-  const [source,setSource] = useState('');
-  const [taskLink,setTaskLink] = useState(taskId ?? '');
-  const [expiresAt,setExpiresAt] = useState('');
-  const [evidence,setEvidence] = useState('');
+  const [selected,setSelected] = useWindowState<MemoryEntry|null>(`facts:${projectId}.selected`,null,(v:any)=>v===null||v&&typeof v.id==='string'&&typeof v.version==='number'&&Array.isArray(v.evidenceRefs));
+  const [query,setQuery] = useWindowState(`facts:${projectId}.query`,'');
+  const [kind,setKind] = useWindowState<MemoryKind>(`facts:${projectId}.kind`,'lesson');
+  const [title,setTitle] = useWindowState(`facts:${projectId}.title`,'');
+  const [body,setBody] = useWindowState(`facts:${projectId}.body`,'');
+  const [source,setSource] = useWindowState(`facts:${projectId}.source`,'');
+  const [taskLink,setTaskLink] = useWindowState(`facts:${projectId}.taskLink`,taskId ?? '');
+  const [expiresAt,setExpiresAt] = useWindowState(`facts:${projectId}.expiresAt`,'');
+  const [evidence,setEvidence] = useWindowState(`facts:${projectId}.evidence`,'');
   const [error,setError] = useState('');
   const [notice,setNotice] = useState('');
   const [busy,setBusy] = useState(false);
   const reload = useCallback(async () => {
     const [memory,items,night] = await Promise.all([api('project.memory.get',{projectId}),api('project.memory.entries.list',{projectId}),api('memory.nightly.status')]);
-    if (memory.ok) { setFacts(memory.data.facts);setVersion(memory.data.version); }
+    if (memory.ok) { if(!keepRestoredBackground.current){setFacts(memory.data.facts);setVersion(memory.data.version);} keepRestoredBackground.current=false; }
     else setError(memory.error);
     if (items.ok) { setEntries(items.data);setMatches(items.data);setMatchedBy({}); }
     else setError(items.error);
@@ -1157,13 +1309,17 @@ function FactsModal({ projectId, taskId, onClose }: { projectId: string; taskId:
 
 const rootEl = document.getElementById('root');
 if (rootEl) {
-  createRoot(rootEl).render(<App />);
+  const root=createRoot(rootEl);
+  void api('app.uiState').then((r:any)=>{
+    if(!r.ok)throw new Error(r.error ?? '读取失败');
+    initializeWindowState(r.data);root.render(<App />);
+  }).catch(()=>root.render(<div role="alert">窗口内容读取失败。<button onClick={()=>window.location.reload()}>重试</button></div>));
 }
 
 // 旧任务供应商绑定确认框：用户显式选择后才能继续真实调用（系统不擅自绑定/切换）
 function BindProviderModal({ info, sessionId, onClose, onBound }: { info: AppInfo | null; sessionId: string; onClose: () => void; onBound: () => void }) {
   const [agentId, setAgentId] = useState('');
-  const [selection, setSelection] = useState('');
+  const [selection, setSelection] = useWindowState(`binding:${sessionId}.selection`,'');
   const [busy, setBusy] = useState(false);
   useEffect(() => { void api('session.get', { sessionId }).then((r: any) => { if (r.ok) setAgentId(r.data.agentId); }); }, [sessionId]);
   const choices = (info?.combinations ?? []).filter((combo) => combo.agentId === agentId);

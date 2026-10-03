@@ -23,7 +23,8 @@ test('普通输出不唤醒，另一个任务完成唤醒，返回增量游标',
   const pending=f.service.waitTaskEvents([{taskId:a.id,sinceSeq:0},{taskId:b.id,sinceSeq:0}],500).then(r=>{settled=true;return r;});
   f.store.appendEvent(a.id,'text_delta',{text:'working'});await new Promise(r=>setTimeout(r,10));assert.equal(settled,false);
   f.store.appendEvent(b.id,'result',{text:'done'});const r=await pending;
-  assert.equal(r.reason,'events');assert.equal(r.events.length,1);assert.equal(r.events[0].sessionId,b.id);assert.equal(r.cursors[0].sinceSeq,1);
+  // 任务创建时多一条 scope 审计事件，text_delta 的 seq 变为 2
+  assert.equal(r.reason,'events');assert.equal(r.events.length,1);assert.equal(r.events[0].sessionId,b.id);assert.equal(r.cursors[0].sinceSeq,2);
   assert.equal(f.store.eventListenerCount,0);assert.equal(f.service.waiter.pendingCount,0);
  }finally{f.close();}
 });
@@ -32,7 +33,8 @@ test('分页不丢关键事件，超大文本返回截断，普通历史不进�
   for(let i=0;i<205;i++){f.store.appendEvent(t.id,'text_delta',{text:'x'});f.store.appendEvent(t.id,'error',{message:'y'.repeat(4000)});}
   let cursor=0;const seen=new Set();
   for(let i=0;i<3;i++){const r=await f.service.waitTaskEvents([{taskId:t.id,sinceSeq:cursor}],0);assert.ok(r.events.length<=100);for(const e of r.events){seen.add(e.seq);assert.ok(e.payload.message.length<=1200);}cursor=r.cursors[0].sinceSeq;}
-  assert.equal(seen.size,205);assert.equal(cursor,410);
+  // 205×2 条测试事件 + 任务创建时的 1 条 scope 审计事件
+  assert.equal(seen.size,205);assert.equal(cursor,411);
   const r=await f.service.waitTaskEvents([{taskId:t.id,sinceSeq:cursor}],0);assert.equal(r.reason,'timeout');
  }finally{f.close();}
 });
@@ -76,8 +78,12 @@ test('HTTP 等待请求断开释放服务监听，控制通道继续响应',asyn
   const info=await server.start(path.join(f.dir,'control.json'));const t=f.task();
   const req=http.request({host:'127.0.0.1',port:info.port,path:'/v1/rpc',method:'POST',headers:{authorization:`Bearer ${info.token}`}});
   req.on('error',()=>{});req.end(JSON.stringify({method:'tasks.wait',params:{targets:[{taskId:t.id,sinceSeq:0}],timeoutMs:20000}}));
-  await new Promise(r=>setTimeout(r,30));assert.equal(f.service.waiter.pendingCount,1);
-  req.destroy();await new Promise(r=>setTimeout(r,30));assert.equal(f.service.waiter.pendingCount,0);assert.equal(f.store.eventListenerCount,0);
+  const until=async(expected:number)=>{
+    const deadline=Date.now()+1500;
+    while(f.service.waiter.pendingCount!==expected && Date.now()<deadline)await new Promise(r=>setTimeout(r,10));
+    assert.equal(f.service.waiter.pendingCount,expected);
+  };
+  await until(1);req.destroy();await until(0);assert.equal(f.store.eventListenerCount,0);
  }finally{server.stop();f.close();}
 });
 test('创建快照写入失败回滚任务，取消后晚到result不能覆盖停止状态',async()=>{
@@ -292,4 +298,46 @@ test('repeated Claude resume failures retain the native id and never become a fr
  assert.deepEqual(resumes,['native-stable-id','native-stable-id']);
  assert.deepEqual(ends,['error','error']);
  await session.close();
+});
+
+test('Claude start and native resume preserve ask-all settings and permission callback IDs',async()=>{
+ const options:any[]=[],calls:any[]=[];let ended!:()=>void;
+ const waitForEnd=()=>new Promise<void>(resolve=>{ended=resolve;});let endGate=waitForEnd();
+ const session=new ClaudeCodeSession({cwd:'/tmp',model:'test',env:{},
+  canUseTool:async(name,input,ctx)=>{calls.push({name,input,ctx});return {behavior:'deny'};},
+  onEvent:()=>{},onEnd:()=>{ended();}},async()=>({query:((request:any)=>{
+   options.push(request.options);const round=options.length;
+   return {close(){},interrupt:async()=>{},async *[Symbol.asyncIterator](){
+    await request.prompt[Symbol.asyncIterator]().next();
+    yield {type:'system',subtype:'init',session_id:'native-policy-id'};
+    const result=await request.options.canUseTool('Bash',{command:'true'},{toolUseID:`call-${round}`,requestId:`request-${round}`});
+    assert.equal(result.behavior,'deny');
+    yield {type:'result',num_turns:1,is_error:false,result:'done'};
+   }} as any;
+  }) as any}));
+ try{
+  session.start();await session.send('first');await endGate;
+  endGate=waitForEnd();await session.send('resume');await endGate;
+  assert.equal(options.length,2);
+  for(const option of options){
+   assert.deepEqual(option.settings,{permissions:{ask:['*']}});
+   assert.equal(option.permissionMode,'default');
+   assert.deepEqual(option.settingSources,[]);
+   assert.equal(option.allowDangerouslySkipPermissions,undefined);
+  }
+  assert.equal(options[0].resume,undefined);assert.equal(options[1].resume,'native-policy-id');
+  assert.deepEqual(calls.map(c=>c.ctx),[{toolUseId:'call-1',requestId:'request-1'},{toolUseId:'call-2',requestId:'request-2'}]);
+ }finally{await session.close();}
+});
+
+test('Claude SDK error results retain the failure reason without credential values',()=>{
+ const events:any[]=[];
+ const secret='SDK_ERROR_SECRET_SENTINEL';
+ const session=new ClaudeCodeSession({cwd:os.tmpdir(),model:'fixture',env:{ANTHROPIC_AUTH_TOKEN:secret},
+   onEvent:e=>events.push(e),onEnd:()=>{}});
+ (session as any).dispatch({type:'result',is_error:true,subtype:'error_during_execution',
+   errors:[`Missing working directory; ${secret}`],num_turns:0});
+ const result=events.find(e=>e.kind==='result');
+ assert.equal(result.isError,true);assert.match(result.text,/Missing working directory/);
+ assert.equal(JSON.stringify(events).includes(secret),false);
 });

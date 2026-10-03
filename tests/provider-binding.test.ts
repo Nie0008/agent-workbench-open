@@ -48,6 +48,7 @@ beforeEach(() => {
   cm = new CredentialManager(ccDb, { ttlMs: 0 });
   store = new Store(wbDb);
   ts = new TaskService(store, cm);
+  ts.importModelProfiles(); // Synthetic fixtures represent already configured installations.
   ts.broadcast = () => {};
   ts.registerMockScript('fast', FAST);
 });
@@ -100,6 +101,7 @@ test('委派子任务继承父任务供应商与模型；重启恢复后绑定�
   store = new Store(wbDb);
   cm = new CredentialManager(ccDb, { ttlMs: 0 });
   ts = new TaskService(store, cm);
+  ts.importModelProfiles(); // Synthetic fixtures represent already configured installations.
   ts.broadcast = () => {};
   ts.registerMockScript('fast', FAST);
   ts.restoreOnStartup();

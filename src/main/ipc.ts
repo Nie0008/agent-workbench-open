@@ -8,14 +8,16 @@ import * as path from 'node:path';
 import { tree, readTextFile, writeTextFile, lineDiff, gitDiffPath, isGitRepo } from './files';
 
 export function registerIpc(taskService: TaskService, getWindow: () => BrowserWindow | null, dataDir: string,
-  hideWindow?: () => boolean, nightly?: NightlyMemoryService | null) {
+  hideWindow?: () => boolean | Promise<boolean>, nightly?: NightlyMemoryService | null) {
   const ts = taskService;
   const ipcLog = (msg: string) => {
     try { fs.appendFileSync(path.join(dataDir, 'main.log'), `${new Date().toISOString()} [ipc] ${msg}\n`); } catch { /* ignore */ }
   };
   taskService.broadcast = (e: WorkbenchEvent) => {
     const w = getWindow();
-    if (w && !w.isDestroyed()) w.webContents.send('wb:event', e);
+    if (w && !w.isDestroyed()) {
+      try { w.webContents.send('wb:event', e); } catch { /* 事件已落盘，窗口销毁不影响任务 */ }
+    }
   };
 
   const h = (channel: string, handler: (p: any) => any) => {
@@ -52,8 +54,17 @@ export function registerIpc(taskService: TaskService, getWindow: () => BrowserWi
     };
   });
 
-  h('app.hide', () => {
-    if (!hideWindow?.()) throw new Error('菜单栏暂不可用，请重新启动工作台后再试');
+  ts.store.enableTaskNotices();
+  h('app.uiState', () => {
+    const state=JSON.parse(ts.store.getKV('windowState.v1') ?? '{}');
+    if(!state || typeof state!=='object' || Array.isArray(state))throw new Error('窗口内容格式无效');
+    return state;
+  });
+  h('notices.list', () => ts.store.taskNotices());
+  h('notices.import', (p) => { ts.store.importTaskNotices(p.notices); return ts.store.taskNotices(); });
+  h('notices.ack', (p) => { ts.store.ackTaskNotices(p.taskId); return ts.store.taskNotices(); });
+  h('app.hide', async () => {
+    if (!await hideWindow?.()) throw new Error('未能收起窗口，请处理提示后重试');
     return {};
   });
   h('app.windowState', () => ({ visible: getWindow()?.isVisible() ?? false }));
@@ -92,7 +103,8 @@ export function registerIpc(taskService: TaskService, getWindow: () => BrowserWi
   h('credentials.delete', (p) => ts.deleteCredentialSource(String(p.providerId ?? '')));
 
   h('sessions.create', (p) => ts.createMainSession({
-    projectId: p.projectId, title: p.title, prompt: p.prompt, scope: { fileWrite: p.fileWrite === true },
+    projectId: p.projectId, title: p.title, prompt: p.prompt,
+    scope: p.scope ?? { fileWrite: p.fileWrite === true }, scopeSource: 'ui',
     agentId: p.agentId, model: p.model, providerId: p.providerId, mockScript: p.mockScript,
   }));
 
@@ -100,7 +112,7 @@ export function registerIpc(taskService: TaskService, getWindow: () => BrowserWi
   h('task.cancel', (p) => ts.cancel(p.sessionId, { cascade: true }));
   h('events.list', (p) => ts.listEvents(p.sessionId, p.sinceSeq ?? 0));
 
-  h('permissions.respond', (p) => ts.respondPermission(p.permissionId, p.decision));
+  h('permissions.respond', (p) => ts.respondPermission(p.permissionId, p.decision, undefined, 'ui'));
 
   h('settings.get', () => ts.getSettings());
   h('settings.set', (p) => ts.setSettings(p));

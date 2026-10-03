@@ -1,5 +1,5 @@
 // Electron 主进程入口：窗口、服务装配、控制通道、启动恢复
-import { app, BrowserWindow, powerMonitor, safeStorage } from 'electron';
+import { app, BrowserWindow, Notification, powerMonitor, safeStorage } from 'electron';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +11,7 @@ import { registerIpc } from './ipc';
 import { createWorkbenchMcpServer } from './mcp/agentTools';
 import { DesktopShell } from './desktopShell';
 import { NightlyMemoryService } from './nightlyMemory';
+import { workbenchDataDir } from './paths';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -22,12 +23,9 @@ let quitting = false;
 let shutdownComplete = false;
 
 // 隔离验收实例可指定独立数据目录；正式启动仍使用系统默认目录。
-if (process.env.WORKBENCH_DATA_DIR) {
-  const isolatedDataDir = path.resolve(process.env.WORKBENCH_DATA_DIR);
-  fs.mkdirSync(isolatedDataDir, { recursive: true });
-  app.setPath('userData', isolatedDataDir);
-}
-const dataDir = app.getPath('userData'); // ~/Library/Application Support/Agent Workbench
+const dataDir = workbenchDataDir();
+fs.mkdirSync(dataDir, { recursive: true });
+app.setPath('userData', dataDir);
 
 // 主进程文件日志（轻量，便于打包版诊断）
 const mainLog = path.join(dataDir, 'main.log');
@@ -131,11 +129,39 @@ if (!gotLock) {
     control.desktopFn = async (action) => {
       if (!desktop) throw new Error('当前实例没有桌面窗口');
       if (action === 'show') await desktop.show();
-      if (action === 'hide' && !desktop.hide()) throw new Error('菜单栏当前不可用');
+      if (action === 'hide' && !await desktop.hide()) throw new Error('未能收起窗口，请处理提示后重试');
       return desktop.snapshot();
     };
+    // 通知点击同款深度链接入口（control 验证/外部通知代理共用；不改变权限状态）
+    control.openTaskFn = (taskId: string) => { try { desktop?.openTask(taskId); } catch { /* 未开窗口时忽略 */ } };
     registerIpc(taskService, () => desktop?.getWindow() ?? null, dataDir,
       () => desktop?.hide() ?? false, nightly);
+
+    // 待授权的用户通知与处理入口：
+    //  - 每条"新逻辑待授权"发一次系统通知（协议重试在 TaskService 内去重，不会重复提醒）；
+    //  - 点击通知 / 菜单栏"待授权"项 → 打开工作台并定位任务，在界面内批准/拒绝；
+    //  - 托盘计数由事件流（服务端事实）驱动，界面重启后计数自动恢复。
+    const agentNames: Record<string, string> = { 'claude-code': 'Claude Code', grok: 'Grok Build', dsh: 'DSH', zcode: 'ZCode' };
+    taskService.permissionNotifier = (info) => {
+      const refresh = () => desktop?.setPendingCount(taskService.pendingPermissionCount);
+      refresh();
+      log(`[notify] 待授权提醒 task=${info.taskId} tool=${info.toolName} reason=${info.reason}`);
+      try {
+        if (!Notification.isSupported()) return;
+        const n = new Notification({
+          title: 'Agent Workbench · 需要你的授权',
+          body: `「${info.title}」（${agentNames[info.agentId] ?? info.agentId}）请求 ${info.toolName}\n${info.reason}`,
+          silent: false,
+        });
+        n.on('click', () => { try { desktop?.openTask(info.taskId); } catch { /* ignore */ } });
+        n.show();
+      } catch { /* 通知失败不阻塞授权流程 */ }
+    };
+    store?.subscribeEvents((e) => {
+      if (e.type === 'permission_request' || e.type === 'permission_resolved') {
+        desktop?.setPendingCount(taskService.pendingPermissionCount);
+      }
+    });
     // 默认供应商：优先上次使用 → CC Switch 当前供应商
     let providers: any[] = [];
     if (process.env.WORKBENCH_SKIP_CC !== '1') providers = taskService.credentials.listProviderInfos();
@@ -149,8 +175,21 @@ if (!gotLock) {
     const resuming = store && process.env.WORKBENCH_SKIP_RESTORE !== '1' ? taskService.restoreOnStartup() : [];
 
     if (process.env.WORKBENCH_SKIP_WINDOW !== '1') {
-      desktop = new DesktopShell(createWindow, log);
-      await desktop.start();
+      desktop = new DesktopShell(createWindow, log, async (win) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const state = await Promise.race([
+            win.webContents.executeJavaScript('window.__workbenchWindowSnapshot()', true),
+            new Promise((_,reject)=>{ timer=setTimeout(()=>reject(new Error('仍有保存或发送操作未完成')),5000); }),
+          ]);
+          if (!state || typeof state!=='object' || Array.isArray(state)) throw new Error('窗口状态尚未就绪');
+          const encoded=JSON.stringify(state);
+          // ponytail: cap retained UI drafts; larger files keep their window open rather than lose edits.
+          if (Buffer.byteLength(encoded)>16*1024*1024) throw new Error('未保存内容过大，请先保存文件');
+          store!.setKV('windowState.v1',encoded);
+        } finally { if (timer) clearTimeout(timer); }
+      });
+      await desktop.start(process.env.WORKBENCH_START_HIDDEN === '1');
     }
     nightly?.start();
     powerMonitor.on('resume', () => nightly?.onResume());

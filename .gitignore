@@ -20,3 +20,7 @@ control.json
 # Local reports may include machine paths and task material
 docs/analysis/
 docs/verification/
+docs/internal/
+docs/plans/
+docs/MEMORY-V1.md
+security-audit-report-*.md
