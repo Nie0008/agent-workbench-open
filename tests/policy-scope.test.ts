@@ -417,7 +417,7 @@ test('policyCheck：Bash 按任务范围联动，网络与未知工具逐条请�
 });
 
 test('真实 Docker 隔离检查：构建和测试自动执行、结果持久化、越界命令待授权',
-  { skip: process.env.WORKBENCH_TEST_DOCKER !== '1' }, async () => {
+  { skip: process.platform === 'win32' || process.env.WORKBENCH_TEST_DOCKER !== '1' }, async () => {
     const image = 'sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31';
     const commands = ['python -m compileall -q .', 'python -m unittest discover -v',
       'python -c "import os,socket; print(os.getenv(\'ANTHROPIC_AUTH_TOKEN\',\'HIDDEN\'), os.path.exists(\'.env\'), socket.socket().connect_ex((\'1.1.1.1\',80)))"'];
@@ -456,7 +456,30 @@ test('真实 Docker 隔离检查：构建和测试自动执行、结果持久化
     assert.equal((await outside).ok, false);
   });
 
-test('重启前已启动但结果未知的隔离检查，同一快照不自动重跑', async () => {
+test('只改变可执行权限的隔离检查不能复用之前通过的缓存', { skip: process.platform === 'win32' }, async () => {
+  const image = `sha256:${'a'.repeat(64)}`;
+  const command = './check.sh';
+  const script = path.join(f.project.rootPath, 'check.sh');
+  fs.writeFileSync(script, '#!/bin/sh\nexit 0\n');
+  fs.chmodSync(script, 0o755);
+  const task = f.task({ scope: { isolatedChecks: { image, commands: [command] } } });
+  (f.service as any).setStatus(task.id, 'running');
+  const snapshot = await makeSnapshot(f.project.rootPath);
+  const key = `isolated:${crypto.createHash('sha256').update(image).update('\0').update(command)
+    .update('\0').update(snapshot.digest).digest('hex')}`;
+  await removeSnapshot(snapshot.directory);
+  // Seed a persisted successful result; no container or host credentials are needed.
+  f.store.firstRun(task.id, key);
+  f.store.completeTool(task.id, key, { ok: true, exitCode: 0, output: 'previous pass' });
+  assert.equal((await f.service.runIsolatedCheck(task.id, command)).cached, true);
+  fs.chmodSync(script, 0o644);
+  const changed = await f.service.runIsolatedCheck(task.id, command);
+  assert.notEqual(changed.cached, true, 'chmod must invalidate the persisted pass');
+  assert.equal(changed.ok, false, 'the synthetic image cannot run and must not return the old pass');
+  assert.equal(f.events(task.id).filter(e => e.type === 'tool_request' && e.payload.name === 'IsolatedCheck').length, 1);
+});
+
+test('重启前已启动但结果未知的隔离检查，同一快照不自动重跑', { skip: process.platform === 'win32' }, async () => {
   const image = `sha256:${'a'.repeat(64)}`;
   const command = 'python -m unittest discover -v';
   const task = f.task({ scope: { fileWrite: false, bash: 'none', network: false,
@@ -473,7 +496,7 @@ test('重启前已启动但结果未知的隔离检查，同一快照不自动�
   assert.equal(f.events(task.id).filter((e) => e.type === 'tool_request' && e.payload.name === 'IsolatedCheck').length, 0);
 });
 
-test('无隔离检查范围时，指定镜像与命令只可经一次人工确认', async () => {
+test('无隔离检查范围时，指定镜像与命令只可经一次人工确认', { skip: process.platform === 'win32' }, async () => {
   const task = f.task({ scope: { fileWrite: false, bash: 'none', network: false } });
   (f.service as any).setStatus(task.id, 'running');
   assert.equal((await f.service.runIsolatedCheck(task.id, 'python -m unittest')).ok, false);
@@ -488,7 +511,7 @@ test('无隔离检查范围时，指定镜像与命令只可经一次人工确�
   assert.equal(f.events(task.id).filter((e) => e.type === 'tool_request' && e.payload.name === 'IsolatedCheck').length, 0);
 });
 
-test('一次批准后的同快照隔离检查重试复用结果，不再请求批准', async () => {
+test('一次批准后的同快照隔离检查重试复用结果，不再请求批准', { skip: process.platform === 'win32' }, async () => {
   const task = f.task({ scope: { fileWrite: false, bash: 'none', network: false } });
   (f.service as any).setStatus(task.id, 'running');
   const image = `sha256:${'a'.repeat(64)}`;

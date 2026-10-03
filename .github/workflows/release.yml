@@ -3,7 +3,7 @@ name: Portable desktop packages
 on:
   workflow_dispatch:
   push:
-    branches: ['main', 'codex/productization-install-controllers', 'codex/open-productization']
+    branches: ['main', 'codex/productization-install-controllers', 'codex/open-productization', 'codex/fix-postmerge-isolated-install']
     tags: ['v*']
     paths-ignore: ['docs/**', 'README.md']
 
@@ -42,9 +42,9 @@ jobs:
           REF: ${{ github.ref }}
           TAG: ${{ github.ref_name }}
         run: |
-          if [ "$EVENT" = workflow_dispatch ] || [ "$REF" = refs/heads/codex/productization-install-controllers ] || [ "$REF" = refs/heads/codex/open-productization ] || [ "$REF" = refs/heads/main ]; then
+          if [ "$EVENT" = workflow_dispatch ] || [ "$REF" = refs/heads/codex/productization-install-controllers ] || [ "$REF" = refs/heads/codex/open-productization ] || [ "$REF" = refs/heads/codex/fix-postmerge-isolated-install ] || [ "$REF" = refs/heads/main ]; then
             case "$REF" in
-              refs/heads/main|refs/heads/codex/productization-install-controllers|refs/heads/codex/open-productization) ;;
+              refs/heads/main|refs/heads/codex/productization-install-controllers|refs/heads/codex/open-productization|refs/heads/codex/fix-postmerge-isolated-install) ;;
               *) echo 'Verification supports main and the productization candidate branches only'; exit 1 ;;
             esac
           else
@@ -66,7 +66,7 @@ jobs:
       - name: Verify packaging and installer contracts
         run: |
           npm run build:test
-          node --test dist-test/package-install.test.js dist-test/setup-cli.test.js dist-test/config-discovery.test.js dist-test/runtime-platform.test.js dist-test/cli.test.js
+          node --test dist-test/package-install.test.js dist-test/isolated-check.test.js dist-test/setup-cli.test.js dist-test/config-discovery.test.js dist-test/runtime-platform.test.js dist-test/cli.test.js
       - name: Production build and native packaging
         run: |
           npm run build

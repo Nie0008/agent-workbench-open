@@ -2,7 +2,7 @@
 // 冲突/合并、恢复语义。renderer、Agent 工具、外部 MCP 共用此服务。
 import * as crypto from 'node:crypto';
 import * as path from 'node:path';
-import { makeSnapshot, removeSnapshot, runIsolatedContainer, stopIsolatedContainer } from './isolatedCheck';
+import { isolatedCheckUnavailableReason, makeSnapshot, removeSnapshot, runIsolatedContainer, stopIsolatedContainer } from './isolatedCheck';
 import { Store } from './store';
 import { MemoryService, MEMORY_CONTEXT_HEADER, type MemoryEntryInput, type MemoryEntryPatch } from './memoryService';
 import { TaskWaiter, type WatchTarget } from './scheduler';
@@ -377,6 +377,8 @@ export class TaskService {
       : validateScopeInput(input.scope);
     if (!scopeCheck.ok) throw new Error(scopeCheck.error);
     const scope = scopeCheck.scope;
+    const unavailable = scope.isolatedChecks ? isolatedCheckUnavailableReason() : undefined;
+    if (unavailable) throw new Error(unavailable);
     if (scope.readRoots?.length) scope.readRoots = canonicalReadRoots(scope.readRoots);
     // 幂等指纹包含完整范围（fileWrite/bash/network），范围不同即视为不同请求
     const fingerprint = JSON.stringify([input.projectId,input.title,input.prompt??'',input.agentId??'claude-code',input.model??null,input.providerId??null,scopeFingerprintPart(scope),input.background??'',input.mockScript??null]);
@@ -638,6 +640,8 @@ export class TaskService {
   }
 
   async runIsolatedCheck(taskId: string, command: string, requestedImage?: string): Promise<{ ok: boolean; exitCode?: number; output?: string; cached?: boolean; error?: string }> {
+    const unavailable = isolatedCheckUnavailableReason();
+    if (unavailable) return { ok: false, error: unavailable };
     const session = this.store.getSession(taskId);
     if (!session || !['running', 'waiting_permission', 'resuming'].includes(session.status))
       return { ok: false, error: '任务没有正在执行的会话' };

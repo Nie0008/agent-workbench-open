@@ -233,6 +233,36 @@ test('Windows install verifies SHA, backs up an idle version and refuses its run
   }
 });
 
+test('Windows install rolls back new commands after a PATH write failure and restores independent backups', { skip: process.platform !== 'win32' }, async () => {
+  const f = fixture('win32', 'x64');
+  try {
+    const { packagePlatform } = await packager;
+    const result = await packagePlatform({ root: f.root, electronDir: f.runtime, platform: 'win32', arch: 'x64' });
+    // Inject failure only at the registry write; execute the actual move/rollback code.
+    const installer = fs.readFileSync(path.join(repository, 'scripts/install.ps1'), 'utf8');
+    const failing = installer.replace(/^\s*\[Environment\]::SetEnvironmentVariable\('Path',.*$/m, "      throw 'INJECTED_PATH_WRITE_FAILURE'");
+    assert.notEqual(failing, installer, 'the registry failure injection must match');
+    const injectedScript = path.join(f.root, 'fail-path.ps1');
+    fs.writeFileSync(injectedScript, failing);
+    for (const previous of ['neither', 'both', 'app-only', 'bin-only']) {
+      const installRoot = path.join(f.root, previous);
+      const hadApp = previous === 'both' || previous === 'app-only';
+      const hadBin = previous === 'both' || previous === 'bin-only';
+      if (hadApp) write(installRoot, 'app/old-only.txt', 'previous app');
+      if (hadBin) write(installRoot, 'bin/workbench.cmd', 'previous command');
+      const run = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+        injectedScript, '-Archive', result.zip, '-InstallRoot', installRoot], { encoding: 'utf8' });
+      assert.notEqual(run.status, 0, run.stdout + run.stderr);
+      assert.match(run.stderr, /INJECTED_PATH_WRITE_FAILURE/);
+      assert.equal(fs.existsSync(path.join(installRoot, 'app')), hadApp, previous);
+      assert.equal(fs.existsSync(path.join(installRoot, 'bin')), hadBin, previous);
+      if (hadApp) assert.deepEqual(fs.readdirSync(path.join(installRoot, 'app')), ['old-only.txt']);
+      if (hadBin) assert.equal(fs.readFileSync(path.join(installRoot, 'bin/workbench.cmd'), 'utf8'), 'previous command');
+      assert.equal(fs.readdirSync(installRoot).some(name => /backup-|^\.stage-/.test(name)), false, previous);
+    }
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test('macOS private releases use authenticated gh with exact asset patterns and no curl', { skip: process.platform !== 'darwin' }, async () => {
   const f = fixture('darwin', process.arch);
   try {
