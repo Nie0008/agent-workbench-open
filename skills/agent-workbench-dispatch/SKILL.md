@@ -12,4 +12,4 @@ Use this skill when the user asks to run a task through Agent Workbench. The des
 3. Keep the printed `requestId` and `taskId`. If a request is interrupted and needs a retry, pass the same `--request-id` with the same arguments to avoid creating a duplicate task.
 4. The command prints the agent's result when the turn ends. A task needing permission or conflict handling exits with code 2; inspect it in the Workbench app, then use `agent-workbench result TASK_ID` to read its status. Verify changed files and acceptance criteria yourself.
 
-Never put an API key in the prompt, command arguments, Skill file, or repository. Configure credentials in the Workbench model settings. MCP clients can also register `agent-workbench mcp` as a stdio server; that exposes Workbench task tools, not credential management.
+Never put an API key in the prompt, command arguments, Skill file, or repository. Configure credentials in the Workbench model settings. MCP clients can also register `workbench mcp` (or the compatible `agent-workbench mcp`) as a stdio server; that exposes Workbench task tools, not credential management.

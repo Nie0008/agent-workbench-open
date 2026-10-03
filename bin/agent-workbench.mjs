@@ -8,6 +8,8 @@ import { createInterface } from 'node:readline';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const entry = path.join(root, 'dist/main/mcp/entry.js');
+const cliEntry = path.join(root, 'dist/main/cli.js');
+const runtimeEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1' };
 const usage = `Usage:
   agent-workbench agents
   agent-workbench mcp
@@ -16,7 +18,7 @@ const usage = `Usage:
   agent-workbench result TASK_ID`;
 
 function ensureBuilt() {
-  if (fs.existsSync(entry)) return;
+  if (fs.existsSync(entry) && fs.existsSync(cliEntry)) return;
   if (root.endsWith('.app/Contents/Resources/app')) throw new Error('Packaged MCP entry is missing');
   try { execFileSync(process.execPath, [path.join(root, 'scripts/build.mjs')], { cwd: root, stdio: 'ignore' }); }
   catch { throw new Error('Build failed. Run npm ci and npm run build to inspect the error.'); }
@@ -38,7 +40,7 @@ function parseOptions(args) {
 
 async function connect() {
   ensureBuilt();
-  const child = spawn(process.execPath, [entry], { stdio: ['pipe','pipe','ignore'] });
+  const child = spawn(process.execPath, [entry], { env: runtimeEnv, stdio: ['pipe','pipe','ignore'] });
   const lines = createInterface({ input: child.stdout });
   const pending = new Map();
   let sequence = 0;
@@ -89,18 +91,16 @@ async function ensureRunning(client) {
   catch (error) {
     if (!String(error.message).includes('未运行')) throw error;
   }
-  const packaged = root.endsWith('.app/Contents/Resources/app');
-  const cmd = packaged ? 'open' : path.join(root, 'node_modules/.bin/electron');
-  const args = packaged ? [path.resolve(root, '../../..')] : ['.'];
-  if (!packaged && !fs.existsSync(cmd)) throw new Error('Electron is not installed. Run npm ci first.');
-  const app = spawn(cmd, args, { cwd: root, detached: true, stdio: 'ignore' });
-  app.on('error', () => {});
-  app.unref();
-  for (let i = 0; i < 40; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    try { return await client.call('workbench_list_projects'); } catch { /* app still starting */ }
-  }
-  throw new Error('Workbench did not start within 20 seconds; start the desktop app and retry');
+  if (!fs.existsSync(cliEntry)) throw new Error('Workbench startup command is missing; rebuild or reinstall the application');
+  await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [cliEntry, 'start'], { env: runtimeEnv, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    const timer = setTimeout(() => { child.kill(); reject(new Error('Workbench startup timed out')); }, 25_000);
+    child.stderr.on('data', data => { stderr = (stderr + data).slice(-4096); });
+    child.on('error', error => { clearTimeout(timer); reject(error); });
+    child.on('exit', code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(stderr.trim() || 'Workbench startup failed')); });
+  });
+  return client.call('workbench_list_projects');
 }
 
 async function main() {
@@ -110,7 +110,8 @@ async function main() {
     if (args.length) throw new Error(usage);
     ensureBuilt();
     await new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [entry], { stdio: 'inherit' });
+      // The shared installed entry starts the hidden background service on demand.
+      const child = spawn(process.execPath, [cliEntry, 'mcp'], { env: runtimeEnv, stdio: 'inherit' });
       child.on('error', reject);
       child.on('exit', (code) => { process.exitCode = code ?? 1; resolve(); });
     });

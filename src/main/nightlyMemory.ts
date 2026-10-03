@@ -63,6 +63,7 @@ async function extractWithGlm(tasks: TaskService, turn: SourceTurn, signal: Abor
   // Use the same CC Switch credential source as Workbench's GLM tasks. No fallback
   // to another model/provider: an unavailable binding is visible as a failed run.
   const profiles = tasks.modelCatalog.availableProfiles().filter((item) => item.model === MODEL
+    && item.providerId !== 'native:claude'
     && item.agents.includes('claude-code')
     && tasks.modelCatalog.sourceInfo(item.providerId)?.baseUrl.replace(/\/$/,'') === GLM_BASE);
   if (profiles.length !== 1) throw new Error(profiles.length

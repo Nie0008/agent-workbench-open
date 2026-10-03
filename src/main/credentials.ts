@@ -1,10 +1,13 @@
-// 凭据只在主进程解密或从 CC Switch 读取；renderer 只收到来源元数据。
+// 凭据仅在主进程解密或从本机来源读取；界面只收到来源元数据。
 import { DatabaseSync } from 'node:sqlite';
 import * as crypto from 'node:crypto';
+import * as os from 'node:os';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type { ProviderInfo } from '../shared/types';
 import type { Store } from './store';
 
-const CC_SWITCH_DB = `${process.env.HOME}/.cc-switch/cc-switch.db`;
+const CC_SWITCH_DB = path.join(os.homedir(), '.cc-switch', 'cc-switch.db');
 
 const NON_SENSITIVE_ENV_KEYS = [
   'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL',
@@ -59,6 +62,20 @@ function readProviderEnv(dbPath: string, providerId: string): ResolvedEnv | null
   } finally {
     db.close();
   }
+}
+
+function nativeClaudeEnv(): ResolvedEnv | null {
+  try {
+    const file = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'settings.json');
+    if (fs.statSync(file).size > 1024 * 1024) return null;
+    const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const base: Record<string,string> = {}, secret: Record<string,string> = {};
+    for (const key of NON_SENSITIVE_ENV_KEYS) if (typeof settings.env?.[key] === 'string') base[key] = settings.env[key];
+    for (const key of SECRET_ENV_KEYS) if (typeof settings.env?.[key] === 'string' && settings.env[key]) secret[key] = settings.env[key];
+    if (!base.ANTHROPIC_MODEL && typeof settings.model === 'string') base.ANTHROPIC_MODEL = settings.model;
+    base.ANTHROPIC_BASE_URL ||= 'https://api.anthropic.com';
+    return Object.keys(secret).length ? { base, secret } : null;
+  } catch { return null; }
 }
 
 export class CredentialManager {
@@ -166,15 +183,17 @@ export class CredentialManager {
         env = row && key ? { base: { ...row.baseEnv, ANTHROPIC_BASE_URL: row.baseUrl, ANTHROPIC_MODEL: row.model },
           secret: { [row.authMode === 'auth_token' ? 'ANTHROPIC_AUTH_TOKEN' : 'ANTHROPIC_API_KEY']: key } } : null;
       } catch { env = null; }
-    } else env = readProviderEnv(this.ccSwitchDb, providerId);
+    } else env = providerId === 'native:claude' ? nativeClaudeEnv() : readProviderEnv(this.ccSwitchDb, providerId);
     this.cache.set(providerId, { at: now, env });
     return env;
   }
 
   // 仅非敏感字段：供应商列表（供设置页/组合选择展示）
   listProviderInfos(): ProviderInfo[] {
+    const native = nativeClaudeEnv();
+    const out: ProviderInfo[] = native ? [{ providerId: 'native:claude', name: 'Claude Code 本地模型',
+      baseUrl: native.base.ANTHROPIC_BASE_URL, model: native.base.ANTHROPIC_MODEL || '', isCurrent: false }] : [];
     let db: DatabaseSync | null = null;
-    const out: ProviderInfo[] = [];
     try { db = new DatabaseSync(this.ccSwitchDb, { readOnly: true }); } catch { /* optional source */ }
     try {
       const rows: any[] = db?.prepare("SELECT id,name,settings_config,is_current FROM providers WHERE app_type='claude' ORDER BY sort_index").all() ?? [];

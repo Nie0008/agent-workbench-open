@@ -7,14 +7,14 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const testMode = process.argv.includes('--test');
 
-const common = { bundle: true, sourcemap: 'inline', logLevel: 'silent', target: 'node24' };
+const common = { bundle: true, sourcemap: testMode ? 'inline' : false, logLevel: 'silent', target: 'node24' };
 
 fs.rmSync(path.join(root, 'dist'), { recursive: true, force: true });
 fs.mkdirSync(path.join(root, 'dist/main'), { recursive: true });
 
 await esbuild.build({
   ...common,
-  entryPoints: [path.join(root, 'src/main/main.ts'), path.join(root, 'src/main/mcp/entry.ts')],
+  entryPoints: ['main.ts', 'cli.ts', 'mcp/entry.ts'].map(f => path.join(root, 'src/main', f)),
   outdir: path.join(root, 'dist/main'),
   format: 'esm',
   platform: 'node',
@@ -60,6 +60,7 @@ await esbuild.build({
   outfile: path.join(root, 'dist/renderer/app.js'),
   format: 'iife',
   platform: 'browser',
+  minify: !testMode,
   jsx: 'automatic',
   define: { 'process.env.NODE_ENV': '"production"' },
 });

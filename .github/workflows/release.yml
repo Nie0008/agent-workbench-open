@@ -1,0 +1,170 @@
+name: Portable desktop packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['main', 'codex/productization-install-controllers', 'codex/open-productization']
+    tags: ['v*']
+    paths-ignore: ['docs/**', 'README.md']
+
+permissions:
+  contents: read
+
+# Only the maintained public repository may build or publish this product.
+
+jobs:
+  package:
+    if: github.repository == 'Nie0008/agent-workbench-open'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: darwin
+            arch: arm64
+          - os: macos-15-intel
+            platform: darwin
+            arch: x64
+          - os: windows-latest
+            platform: win32
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Require approved candidate branch or mainline release tag
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ] || [ "$REF" = refs/heads/codex/productization-install-controllers ] || [ "$REF" = refs/heads/codex/open-productization ] || [ "$REF" = refs/heads/main ]; then
+            case "$REF" in
+              refs/heads/main|refs/heads/codex/productization-install-controllers|refs/heads/codex/open-productization) ;;
+              *) echo 'Verification supports main and the productization candidate branches only'; exit 1 ;;
+            esac
+          else
+            git merge-base --is-ancestor HEAD origin/main
+          fi
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+          package-manager-cache: false
+      - run: npm ci
+      - name: Native TypeScript check
+        run: node node_modules/typescript/bin/tsc --noEmit
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: node -e 'const v=require("./package.json").version; if(process.env.TAG!==`v${v}`) throw Error("Tag must match package version")'
+      - name: Verify packaging and installer contracts
+        run: |
+          npm run build:test
+          node --test dist-test/package-install.test.js dist-test/setup-cli.test.js dist-test/config-discovery.test.js dist-test/runtime-platform.test.js dist-test/cli.test.js
+      - name: Production build and native packaging
+        run: |
+          npm run build
+          node scripts/package-platform.mjs --platform '${{ matrix.platform }}' --arch '${{ matrix.arch }}'
+      - name: Extract the release archive into a different runtime directory
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import assert from 'node:assert/strict';
+          import { spawnSync } from 'node:child_process';
+          const archives = fs.readdirSync('release/portable').filter(name => name.endsWith('.zip'));
+          assert.equal(archives.length, 1, 'Exactly one native release archive must be verified');
+          const archive = path.resolve('release/portable', archives[0]);
+          const target = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'agent-workbench-relocated-'));
+          const result = process.platform === 'darwin'
+            ? spawnSync('ditto', ['-x', '-k', archive, target], { encoding: 'utf8', timeout: 60000 })
+            : spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+              'Expand-Archive -LiteralPath $env:WORKBENCH_TEST_ARCHIVE -DestinationPath $env:WORKBENCH_TEST_EXTRACT_DIR -Force'],
+              { env: { ...process.env, WORKBENCH_TEST_ARCHIVE: archive, WORKBENCH_TEST_EXTRACT_DIR: target }, encoding: 'utf8', timeout: 60000 });
+          assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+          const bundle = fs.realpathSync(path.join(target, 'agent-workbench'));
+          const relative = path.relative(fs.realpathSync(process.cwd()), bundle);
+          assert.ok(relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative),
+            'The tested bundle must be outside the source checkout');
+          let symlinks = 0;
+          if (process.platform === 'darwin') {
+            const verifyLinks = directory => {
+              for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+                const file = path.join(directory, entry.name);
+                if (entry.isSymbolicLink()) {
+                  assert.ok(!path.isAbsolute(fs.readlinkSync(file)), `Absolute symlink in archive: ${file}`);
+                  const destination = path.relative(bundle, fs.realpathSync(file));
+                  assert.ok(destination !== '..' && !destination.startsWith(`..${path.sep}`) && !path.isAbsolute(destination),
+                    `Symlink escapes the extracted bundle: ${file}`);
+                  symlinks++;
+                } else if (entry.isDirectory()) verifyLinks(file);
+              }
+            };
+            verifyLinks(bundle);
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV, `WORKBENCH_TEST_BUNDLE=${bundle}\n`);
+          console.log(JSON.stringify({ archive: path.basename(archive), relocatedBundle: bundle, relativeSymlinks: symlinks }));
+          NODE
+      - name: Verify bundled command without importing local configuration
+        run: node -e 'const p=require("path"),cp=require("child_process"),assert=require("assert/strict");assert.ok(process.env.WORKBENCH_TEST_BUNDLE);const command=p.join(process.env.WORKBENCH_TEST_BUNDLE,"bin",process.platform==="win32"?"workbench.cmd":"workbench");const r=cp.spawnSync(command,["--help"],{encoding:"utf8",shell:process.platform==="win32",timeout:15000});process.stdout.write(r.stdout??"");process.stderr.write(r.stderr??"");assert.equal(r.status,0,r.error?.message);assert.match(r.stdout,/Agent Workbench/)'
+      - name: Verify the retained dispatch CLI in the relocated package
+        run: node -e 'const p=require("path"),cp=require("child_process"),assert=require("assert/strict");const command=p.join(process.env.WORKBENCH_TEST_BUNDLE,"bin",process.platform==="win32"?"agent-workbench.cmd":"agent-workbench");const r=cp.spawnSync(command,["--help"],{encoding:"utf8",shell:process.platform==="win32",timeout:15000});assert.equal(r.status,0,r.error?.message??r.stderr);assert.match(r.stdout,/agent-workbench run/)'
+      - name: Verify native packaged backend and shared MCP tools
+        run: |
+          node --input-type=module <<'NODE'
+          import path from 'node:path';
+          import assert from 'node:assert/strict';
+          import { spawnSync } from 'node:child_process';
+          const bundle = process.env.WORKBENCH_TEST_BUNDLE;
+          assert.ok(bundle, 'Only the relocated archive bundle may be used');
+          const mac = process.platform === 'darwin';
+          const app = path.join(bundle, mac ? 'Agent Workbench.app/Contents' : 'app');
+          const resources = path.join(app, mac ? 'Resources' : 'resources');
+          const args = ['tests/controller-integration.mjs', '--cli-entry', path.join(resources, 'app/dist/main/cli.js'),
+            '--app', path.join(app, mac ? 'MacOS/Electron' : 'electron.exe')];
+          const result = spawnSync(process.execPath, args, { stdio: 'inherit', timeout: 120000 });
+          assert.equal(result.status, 0, result.error?.message ?? 'Native packaged MCP integration failed');
+          NODE
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agent-workbench-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            release/portable/*.zip
+            release/portable/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Save installer scripts with the package artifacts
+        if: matrix.platform == 'darwin' && matrix.arch == 'arm64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: installers
+          path: |
+            scripts/install.sh
+            scripts/install.ps1
+          if-no-files-found: error
+
+  release:
+    if: github.repository == 'Nie0008/agent-workbench-open' && startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Publish verified tag assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" release-assets/*.zip release-assets/*.sha256 release-assets/install.sh release-assets/install.ps1 --verify-tag --generate-notes --title "Agent Workbench $RELEASE_TAG"

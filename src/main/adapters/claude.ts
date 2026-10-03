@@ -69,9 +69,17 @@ export class ClaudeCodeSession implements AgentSessionHandle {
           env: this.opts.env,
           pathToClaudeCodeExecutable: resolveClaudeExecutable(),
           permissionMode: 'default',               // 始终保留授权流程，绝不绕过
+          // 原生 default 会自行批准只读调用；ask 规则确保全部工具先经过任务策略。
+          settings: { permissions: { ask: ['*'] } },
           abortController: this.abort,
           settingSources: [],                      // 不加载用户全局配置，保证隔离
-          ...(this.opts.canUseTool ? { canUseTool: this.opts.canUseTool as any } : {}),
+          // 透传 SDK 的 toolUseID/requestId 给统一策略：同一原生调用的协议重试
+          // （如传输断开后 reinitialize 重发 can_use_tool）据此共用一条待授权与决定
+          ...(this.opts.canUseTool ? { canUseTool: (toolName: string, input: any, options?: any) =>
+            this.opts.canUseTool!((toolName), input, {
+              toolUseId: typeof options?.toolUseID === 'string' ? options.toolUseID : undefined,
+              requestId: typeof options?.requestId === 'string' ? options.requestId : undefined,
+            }) as any } : {}),
           ...(this.opts.systemPromptAppend ? {
             systemPrompt: { type: 'preset', preset: 'claude_code', append: this.opts.systemPromptAppend },
           } : { systemPrompt: { type: 'preset', preset: 'claude_code' } }),
@@ -155,7 +163,12 @@ export class ClaudeCodeSession implements AgentSessionHandle {
           },
           costUSD: null, // 端点计价不可靠：费用一律显示未知，不采用估算值
         });
-        onEvent({ kind: 'result', isError: !!msg.is_error, numTurns: msg.num_turns ?? 0, text: String(msg.result ?? '') });
+        let text = String(msg.result ?? (Array.isArray(msg.errors) ? msg.errors.join('\n') : msg.is_error ? msg.subtype ?? 'Claude 执行失败' : ''));
+        for (const key of ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY']) {
+          const secret = this.opts.env[key];
+          if (secret) text = text.replaceAll(secret, '[REDACTED]');
+        }
+        onEvent({ kind: 'result', isError: !!msg.is_error, numTurns: msg.num_turns ?? 0, text });
         break;
       }
       default:

@@ -1,6 +1,48 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { selectedSessionId, unwrapSendResult } from '../src/renderer/send';
+import { projectWindowDrafts } from '../src/renderer/window-drafts';
+
+test('window capture and hydration retain source metadata without credential fields', () => {
+  const secret = 'fake-unsaved-api-key-for-window-test';
+  const source = {
+    providerId: 'workbench-local:fixture', name: 'Local fixture', baseUrl: 'https://example.com/v1',
+    model: 'fixture-model', authMode: 'auth_token', apiKey: secret, authToken: secret,
+    unexpected: { token: secret },
+  };
+  const model = {
+    id: 'profile-fixture', name: 'Fixture model', providerId: source.providerId, model: source.model,
+    agents: ['claude-code', 'zcode', 'invalid-agent'], reasoningLevel: 'max', apiKey: secret,
+    sourceFingerprint: secret,
+  };
+  const restored = projectWindowDrafts({
+    'models.sourceDraft': source, 'newTask.models.sourceDraft': source,
+    'models.draft': model, 'newTask.models.draft': model, 'app.input': 'unsent message',
+  });
+  const expectedSource = {
+    providerId: source.providerId, name: source.name, baseUrl: source.baseUrl,
+    model: source.model, authMode: source.authMode,
+  };
+  assert.deepEqual(restored['models.sourceDraft'], expectedSource);
+  assert.deepEqual(restored['newTask.models.sourceDraft'], expectedSource);
+  assert.deepEqual(restored['models.draft'], {
+    id: model.id, name: model.name, providerId: model.providerId, model: model.model,
+    agents: ['claude-code', 'zcode'], reasoningLevel: 'max',
+  });
+  assert.equal(restored['app.input'], 'unsent message');
+  const encoded = JSON.stringify(restored);
+  assert.equal(encoded.includes(secret), false);
+  assert.deepEqual(projectWindowDrafts(JSON.parse(encoded)), restored, 'a recreated renderer preserves only safe form fields');
+});
+
+test('malformed or cleared source drafts do not survive window hydration', () => {
+  assert.deepEqual(projectWindowDrafts({
+    'models.sourceDraft': { name: 'Missing source fields', apiKey: 'fake-key' },
+    'newTask.models.sourceDraft': null,
+    'models.draft': { agents: [] },
+  }), { 'models.sourceDraft': null, 'newTask.models.sourceDraft': null, 'models.draft': null });
+  assert.deepEqual(projectWindowDrafts(null), {});
+});
 
 test('renderer sends to the selected subtask when one is open', () => {
   assert.equal(selectedSessionId('sub-42', 'main-1'), 'sub-42');

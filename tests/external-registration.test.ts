@@ -24,6 +24,7 @@ test('Workbench catalog shares configured models across local agents and rejects
     name: 'Grok 配置 grok-4.6', baseUrl: '', model: 'grok-4.6', isCurrent: false };
   let configuredProviders = [configured];
   const service = new TaskService(store, new CredentialManager(cc, { ttlMs: 0 }), () => configuredProviders);
+  service.importModelProfiles(); // Explicit synthetic setup.
   try {
     const project = service.createProject(root);
     const ids = service.adapters().map((adapter) => adapter.id);

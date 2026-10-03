@@ -1,10 +1,66 @@
 #!/usr/bin/env python3
 """Stable, project-isolated Grok/GLM entry. Secrets are injected only into child env."""
-import argparse, hashlib, json, os, sqlite3, subprocess, sys
+import argparse, hashlib, json, os, shutil, signal, sqlite3, subprocess, sys
 from pathlib import Path
 
 MODEL = 'glm-5.3-flash'
 BASE = 'https://open.bigmodel.cn/api/coding/paas/v4'
+
+def runtime_executable(command, override=None, env=None):
+    env = os.environ if env is None else env
+    configured = env.get(override, '').strip() if override else ''
+    if configured:
+        candidate = Path(configured).expanduser()
+        return candidate if candidate.is_file() else None
+    found = shutil.which(command, path=env.get('PATH', ''))
+    if found: return Path(found)
+    home = Path.home()
+    bins = [home/'.local/bin', home/'.npm-global/bin', home/'.volta/bin']
+    if command == 'grok': bins.insert(0, Path(env.get('GROK_HOME') or home/'.grok')/'bin')
+    for root in [home/'.local', home/'.nvm/versions/node']:
+        try:
+            for item in sorted(root.iterdir())[:32]:
+                if item.is_dir() and (root.name != '.local' or item.name.startswith('node-')): bins.append(item/'bin')
+        except OSError: pass
+    if os.name == 'nt':
+        if env.get('APPDATA'): bins.append(Path(env['APPDATA'])/'npm')
+    else: bins.extend(map(Path, ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin']))
+    for folder in bins:
+        found = shutil.which(command, path=str(folder))
+        if found: return Path(found)
+    return None
+
+def cli_command(binary, node=None):
+    binary = Path(binary).resolve(strict=True)
+    if binary.suffix.lower() in ('.cmd', '.bat'):
+        # Execute the installed JS entry through Node; never shell a batch shim
+        # containing user-supplied paths or prompts.
+        candidates = [binary.parent/'node_modules/@deepseek-ai/dsh/lib/bin.js',
+                      binary.parent.parent/'lib/node_modules/@deepseek-ai/dsh/lib/bin.js']
+        binary = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if binary is None: raise ValueError('Cannot resolve DSH npm entry; set WORKBENCH_DSH_PATH to its JS entry')
+    if binary.suffix.lower() in ('.js', '.cjs', '.mjs'):
+        node = node or runtime_executable('node', 'WORKBENCH_NODE_PATH')
+        if node is None: raise ValueError('Node.js not found; set WORKBENCH_NODE_PATH')
+        return [str(node), str(binary)]
+    return [str(binary)]
+
+def spawn_options(windows=None):
+    windows = os.name == 'nt' if windows is None else windows
+    return {'creationflags': getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x200)} if windows else {'start_new_session': True}
+
+def terminate_owned_process(process, force=False, windows=None):
+    if process.poll() is not None: return
+    if not isinstance(process.pid, int) or process.pid <= 0 or process.pid == os.getpid():
+        raise ValueError('Refusing to terminate an unrelated process')
+    windows = os.name == 'nt' if windows is None else windows
+    if windows:
+        subprocess.run(['taskkill.exe', '/PID', str(process.pid), '/T'] + (['/F'] if force else []),
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000))
+    else:
+        try: os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+        except ProcessLookupError: pass
 
 def anthropic_provider(db, selected=None):
     if selected and selected.startswith('workbench-local:'):
@@ -13,7 +69,7 @@ def anthropic_provider(db, selected=None):
         if not key or not base.startswith('https://'):
             raise ValueError('Workbench 本地凭据不可用')
         return selected,key,base
-    with sqlite3.connect('file:'+str(db)+'?mode=ro', uri=True) as conn:
+    with sqlite3.connect(Path(db).resolve().as_uri()+'?mode=ro', uri=True) as conn:
         rows = conn.execute("SELECT id,settings_config FROM providers WHERE app_type='claude'").fetchall()
     matches=[]
     for pid, raw in rows:
@@ -78,8 +134,10 @@ def main():
     p.add_argument('--tools',default='',help='Explicit allowed tool list; default no tools, no automatic approval')
     a=p.parse_args();cwd=a.cwd.expanduser().resolve(strict=True)
     if not cwd.is_dir(): raise ValueError('cwd must be a directory')
-    binary=Path.home()/'.grok/bin/grok'
-    if not binary.is_file(): raise ValueError('Grok CLI not installed')
+    binary=runtime_executable('grok','WORKBENCH_GROK_PATH')
+    if binary is None: raise ValueError('Grok CLI not installed; set WORKBENCH_GROK_PATH or PATH')
+    if os.name == 'nt' and binary.suffix.lower() in ('.cmd', '.bat'):
+        raise ValueError('Grok requires its native executable; set WORKBENCH_GROK_PATH to grok.exe')
     if a.max_turns<1 or a.max_turns>400: raise ValueError('max-turns must be 1..400')
     if a.action=='run' and not a.prompt_file: raise ValueError('run requires --prompt-file')
     if not a.model or any(c.isspace() for c in a.model): raise ValueError('Invalid model ID')
@@ -96,7 +154,14 @@ def main():
         # Route explicit delegation through Workbench MCP so child tasks are visible
         # and governed by TaskService rather than hidden Grok subagent sessions.
         env['GROK_SUBAGENTS']='0'
-        os.execve(str(binary),[str(binary),'agent','--no-leader','--model',a.model,'stdio'],env)
+        command=[str(binary),'agent','--no-leader','--model',a.model,'stdio']
+        if os.name != 'nt': os.execve(str(binary),command,env)
+        # Windows exec does not provide POSIX PID replacement semantics. Keep
+        # this launcher alive as the owner of the inherited ACP stdio process.
+        process=subprocess.Popen(command,env=env,cwd=cwd)
+        try: return process.wait()
+        finally:
+            if process.poll() is None: terminate_owned_process(process,force=True)
     print(json.dumps({'configurationLoaded':True,**binding,'grokHome':str(home),'inferenceVerified':False},ensure_ascii=False),flush=True)
     prompt='Reply only: GLM_ENTRY_OK. Do not use any tools.' if a.action=='smoke' else a.prompt_file.read_text()
     cmd=[str(binary),'-p',prompt,'--model',a.model,'--cwd',str(cwd),'--output-format','streaming-json','--max-turns',str(1 if a.action=='smoke' else a.max_turns),'--tools','' if a.action=='smoke' else a.tools,'--disable-web-search']

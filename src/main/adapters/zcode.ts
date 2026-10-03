@@ -8,6 +8,7 @@ import * as crypto from 'node:crypto';
 import * as http from 'node:http';
 import * as https from 'node:https';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import type { AdapterEvent, PermissionOutcome } from '../../shared/types';
 import type { AgentAdapter, AgentSessionHandle, AgentSessionOpts } from './types';
@@ -77,6 +78,53 @@ function safeEnv(source: Record<string, string | undefined>): Record<string, str
     out[k] = v;
   }
   return out;
+}
+
+// ZCode 原生权限链在 build 模式下对非破坏只读工具（Read/Glob/Grep）无条件放行，
+// 不发起 interaction/requestPermission（app-server PermissionService.checkPermission
+// 的 "mode.build.readOnly" 分支），因此项目外读取会静默进入模型上下文。
+// 修复：利用其原生项目权限规则（local_setting 表 scope='project' namespace='permission'
+// key='ruleset'，数据形状 {version:1, ask:[{toolName}] }）注入 ask 规则——此后这些工具
+// 在执行前必须经 interaction/requestPermission 询问宿主，Workbench 统一策略据此对
+// 项目内读取自动放行、对项目外读取请求用户确认。这是执行器原生钩子，不是提示词约束。
+export const ZCODE_NATIVE_ASK_TOOLS = ['Read', 'Glob', 'Grep', 'LS', 'WebFetch', 'WebSearch', 'web_search'];
+export function nativeAskRuleset(): string {
+  return JSON.stringify({ version: 1, ask: ZCODE_NATIVE_ASK_TOOLS.map((toolName) => ({ toolName })) });
+}
+export function seedNativeAskRules(dbPath: string, sessionId: string): boolean {
+  try {
+    const db = new DatabaseSync(dbPath);
+    try {
+      const row: any = db.prepare('SELECT project_id FROM session WHERE id = ?').get(sessionId);
+      // app-server 可在首轮发送前只写 project mode，不写 session 行；该任务的
+      // 隔离库只对应一个 workspace。此时从唯一项目 mode 记录取 scope_id。
+      const modes: any[] = row?.project_id ? [] : db.prepare(`SELECT DISTINCT scope_id FROM local_setting
+        WHERE scope='project' AND namespace='permission' AND key='mode'`).all() as any[];
+      const projectId = row?.project_id ?? (modes.length === 1 ? modes[0].scope_id : null);
+      if (!projectId) return false;
+      const now = Date.now();
+      db.prepare(`INSERT INTO local_setting (scope,scope_id,namespace,key,value,schema_version,time_created,time_updated)
+        VALUES ('project', ?, 'permission', 'ruleset', ?, 1, ?, ?)
+        ON CONFLICT(scope,scope_id,namespace,key) DO UPDATE SET
+          value = excluded.value, schema_version = excluded.schema_version, time_updated = excluded.time_updated`)
+        .run(projectId, nativeAskRuleset(), now, now);
+      return true;
+    } finally { db.close(); }
+  } catch { /* 库结构漂移时降级：后续回合仍会重试 */ }
+  return false;
+}
+
+// session 行可能在 session/create 响应后才持久化。首轮发送必须等到规则落库；
+// 超时返回 false，由调用方停止任务，不能依赖模型响应前的碰运气重试。
+export async function seedNativeAskRulesWithRetry(dbPath: string, sessionId: string,
+    intervalMs = 250, maxWindowMs = 10_000): Promise<boolean> {
+  const started = Date.now();
+  do {
+    if (seedNativeAskRules(dbPath, sessionId)) return true;
+    if (Date.now() - started >= maxWindowMs) break;
+    await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+  } while (true);
+  return false;
 }
 
 export function buildAppServerEnvironment(
@@ -342,6 +390,7 @@ export class ZCodeSession implements AgentSessionHandle {
   private requestSeq = 0;
   private readonly runtimeFactory: RuntimeFactory;
   private readonly toolCalls = new Set<string>();
+  private askSeeded = false;
   private lastResponse = '';
   private assistantMessageEmitted = false;
 
@@ -402,6 +451,8 @@ export class ZCodeSession implements AgentSessionHandle {
       || (this.opts.reasoningLevel && current?.options?.reasoningLevel !== this.opts.reasoningLevel)) {
       throw new Error('ZCode app-server 未激活所选模型配置');
     }
+    this.askSeeded = await seedNativeAskRulesWithRetry(runtime.config.sessionDbPath, this.nativeId!);
+    if (!this.askSeeded) throw new Error('ZCode 原生读取授权规则未能生效，已阻止发送任务');
     this.emit({ kind: 'system', nativeSessionId: this.nativeId, model: this.opts.model });
   }
 
@@ -421,11 +472,18 @@ export class ZCodeSession implements AgentSessionHandle {
       const input = params.input ?? {};
       this.emitToolUse(callId, toolName, input);
       let outcome: PermissionOutcome = { behavior: 'deny', message: 'Workbench permission handler unavailable' };
-      try { if (this.opts.canUseTool) outcome = await this.opts.canUseTool(toolName, input); }
+      try { if (this.opts.canUseTool) outcome = await this.opts.canUseTool(toolName, input, {
+        toolUseId: callId, requestId: typeof params.requestId === 'string' ? params.requestId : undefined,
+      }); }
       catch (e: any) { outcome = { behavior: 'deny', message: String(e?.message ?? 'permission handler failed') }; }
       const decision = outcome.behavior === 'allow' ? 'allow' : 'deny';
       if (decision === 'deny') this.emit({ kind: 'tool_result', toolUseId: callId, name: toolName, isError: true, content: outcome.message ?? 'Denied by Workbench' });
-      return { decision, reason: outcome.message ?? (decision === 'allow' ? 'Allowed by Workbench' : 'Denied by Workbench') };
+      // 兜底注入：把读类工具的 ask 规则随权限响应持久化到项目规则，防库种子失败
+      const permissionUpdates = [{
+        type: 'addRules' as const, behavior: 'ask' as const,
+        rules: ZCODE_NATIVE_ASK_TOOLS.map((t) => ({ toolName: t })),
+      }];
+      return { decision, reason: outcome.message ?? (decision === 'allow' ? 'Allowed by Workbench' : 'Denied by Workbench'), permissionUpdates };
     }
     if (method === 'interaction/requestUserInput') return { action: 'decline' };
     if (method === 'interaction/requestProviderRuntimeHeaders') return { headers: {} };

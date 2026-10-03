@@ -1,3 +1,4 @@
+import {useWindowState} from './window-state';
 import {projectName} from './project-name';
 import React,{useEffect,useState} from 'react';
 import {taskLane,taskLabel,agentName} from './board-model';
@@ -6,7 +7,7 @@ const wb=(window as any).wb;
 const layoutKey='workbench.project-layout.v1';
 const lanes=[{id:'running',label:'执行中'},{id:'permission',label:'等你授权'},{id:'paused',label:'待继续'},{id:'ended',label:'已结束 / 等待指令'}];
 export function ProgressPanel({onClose,onOpen,notices,ack}:{onClose:()=>void;onOpen:(task:any)=>void;notices:TaskNotice[];ack:(id:string)=>void}){
- const [data,setData]=useState<any>(null),[projects,setProjects]=useState<any[]>([]),[error,setError]=useState(''),[query,setQuery]=useState(''),[expanded,setExpanded]=useState<Record<string,boolean>>({}),[showNotices,setShowNotices]=useState(false);
+ const [data,setData]=useState<any>(null),[projects,setProjects]=useState<any[]>([]),[error,setError]=useState(''),[query,setQuery]=useWindowState('board.query','',undefined,true),[expanded,setExpanded]=useWindowState<Record<string,boolean>>('board.expanded',{},undefined,true),[showNotices,setShowNotices]=useWindowState('board.showNotices',false,undefined,true);
  useEffect(()=>{
   let alive=true,busy=false,windowVisible=true,visibilityEvents=0;
   const refresh=async()=>{

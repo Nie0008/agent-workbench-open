@@ -1,10 +1,12 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import type { AgentAdapter, AgentSessionHandle, AgentSessionOpts } from './types';
+import { resolveNodeExecutable, resolvePythonExecutable, resolveRuntimeExecutable, pythonArguments, signalOwnedProcess } from './types';
+import { findExecutable } from '../configDiscovery';
 import { GROK_SUPER_PROVIDER_ID, isGrokConfigProviderId, grokConfigModelFromId } from '../grok-models';
 
 const MAX_LINE_CHARS = 1024 * 1024;
@@ -64,18 +66,6 @@ function resolveWorkbenchMcpEntry(): string {
     try { if (fs.statSync(candidate).isFile()) return candidate; } catch { /* try next */ }
   }
   throw new Error('找不到 Workbench MCP stdio 入口 dist/main/mcp/entry.js');
-}
-
-function resolveNodeExecutable(): string {
-  const configured = process.env.WORKBENCH_NODE_PATH;
-  if (configured) {
-    try { if (fs.statSync(configured).isFile()) return configured; } catch { /* try PATH */ }
-  }
-  try {
-    const node = execFileSync('which', ['node'], { encoding: 'utf8' }).trim();
-    if (node) return node;
-  } catch { /* Electron can run as Node with the child env flag */ }
-  return process.execPath;
 }
 
 function bounded(value: unknown, max: number): string {
@@ -139,16 +129,14 @@ export class GrokSession implements AgentSessionHandle {
     this.deps = {
       scriptPath: deps.scriptPath ?? (opts.providerId === GROK_SUPER_PROVIDER_ID
         || isGrokConfigProviderId(opts.providerId ?? '') ? '' : resolveGrokEntry()),
-      grokPath: deps.grokPath ?? path.join(os.homedir(), '.grok', 'bin', 'grok'),
+      grokPath: deps.grokPath ?? resolveRuntimeExecutable('grok','WORKBENCH_GROK_PATH')
+        ?? findExecutable('grok',{extraPaths:[path.join(process.env.GROK_HOME ?? path.join(os.homedir(),'.grok'),'bin')]}) ?? '',
       workbenchMcpEntry: deps.workbenchMcpEntry ?? '',
       nodePath: deps.nodePath ?? '',
-      pythonPath: deps.pythonPath ?? process.env.WORKBENCH_PYTHON ?? 'python3',
+      pythonPath: deps.pythonPath ?? '',
       spawn: deps.spawn ?? spawn,
       tempRoot: deps.tempRoot ?? os.tmpdir(),
-      signalProcess: deps.signalProcess ?? ((pid, signal) => {
-        if (process.platform !== 'win32') process.kill(-pid, signal);
-        else process.kill(pid, signal);
-      }),
+      signalProcess: deps.signalProcess ?? signalOwnedProcess,
     };
   }
 
@@ -228,9 +216,12 @@ export class GrokSession implements AgentSessionHandle {
     const env = [{
       name: 'WORKBENCH_DATA_DIR',
       value: this.opts.env.WORKBENCH_DATA_DIR
-        ?? path.join(process.env.HOME ?? '', 'Library', 'Application Support', 'Agent Workbench'),
+        ?? process.env.WORKBENCH_DATA_DIR ?? (process.platform==='win32'
+          ? path.join(process.env.APPDATA ?? os.homedir(),'Agent Workbench')
+          : process.platform==='darwin' ? path.join(os.homedir(),'Library','Application Support','Agent Workbench')
+          : path.join(os.homedir(),'.local','share','agent-workbench')),
     }];
-    if (node === process.execPath && /electron/i.test(path.basename(node))) {
+    if (node === process.execPath && process.versions.electron) {
       env.push({ name: 'ELECTRON_RUN_AS_NODE', value: '1' });
     }
     this.delegationServers = [{
@@ -251,15 +242,20 @@ export class GrokSession implements AgentSessionHandle {
           || grokConfigModelFromId(this.opts.providerId ?? '') === this.opts.model;
         if (!isNative && (!this.opts.model || !this.opts.providerId))
           throw new Error('Grok 任务缺少有效的模型与供应商绑定');
+        const python=isNative ? '' : (this.deps.pythonPath || resolvePythonExecutable());
+        if(isNative && !this.deps.grokPath)throw new Error('未找到 Grok CLI，请加入 PATH 或设置 WORKBENCH_GROK_PATH');
         const args = isNative
           ? ['agent', '--no-leader', '--model', this.opts.model, 'stdio']
-          : [this.deps.scriptPath, 'acp', '--cwd', this.opts.cwd, '--provider-id', this.opts.providerId!, '--model', this.opts.model];
+          : [...pythonArguments(python),this.deps.scriptPath, 'acp', '--cwd', this.opts.cwd, '--provider-id', this.opts.providerId!, '--model', this.opts.model];
         if (!isNative && this.opts.taskId) args.push('--workbench-task-id', this.opts.taskId);
-        child = this.deps.spawn(isNative ? this.deps.grokPath : this.deps.pythonPath, args, {
+        const env={...this.opts.env};
+        if(!isNative && this.deps.grokPath)env.WORKBENCH_GROK_PATH=this.deps.grokPath;
+        child = this.deps.spawn(isNative ? this.deps.grokPath : python, args, {
           cwd: this.opts.cwd,
-          env: this.opts.env,
+          env,
           stdio: ['pipe', 'pipe', 'pipe'],
           detached: process.platform !== 'win32',
+          windowsHide:true,
         });
       } catch (e: any) { reject(e); return; }
       this.proc = child;
@@ -382,7 +378,7 @@ export class GrokSession implements AgentSessionHandle {
     try {
       const decision = this.stopping || !this.opts.canUseTool
         ? { behavior: 'deny' as const }
-        : await this.opts.canUseTool(name, input);
+        : await this.opts.canUseTool(name, input, { toolUseId: toolCallId, requestId: String(id) });
       if (pending.settled || !this.permissions.has(id)) return;
       const wanted = decision.behavior === 'allow' ? 'allow_once' : 'reject_once';
       const option = (params.options ?? []).find((item: any) => item.kind === wanted);

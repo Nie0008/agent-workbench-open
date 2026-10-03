@@ -2,6 +2,7 @@
 // 冲突/合并、恢复语义。renderer、Agent 工具、外部 MCP 共用此服务。
 import * as crypto from 'node:crypto';
 import * as path from 'node:path';
+import { makeSnapshot, removeSnapshot, runIsolatedContainer, stopIsolatedContainer } from './isolatedCheck';
 import { Store } from './store';
 import { MemoryService, MEMORY_CONTEXT_HEADER, type MemoryEntryInput, type MemoryEntryPatch } from './memoryService';
 import { TaskWaiter, type WatchTarget } from './scheduler';
@@ -11,11 +12,15 @@ import { DshAdapter } from './adapters/dsh';
 import { GrokAdapter } from './adapters/grok';
 import { ZCodeAdapter } from './adapters/zcode';
 import { ModelCatalog, AGENT_IDS, type ModelProfileInput } from './modelCatalog';
+import { discoverConfiguration } from './configDiscovery';
 import { GROK_SUPER_MODEL, GROK_SUPER_PROVIDER, GROK_SUPER_PROVIDER_ID,
   isGrokConfigProviderId, listGrokConfigProviders, grokSuperConfigAvailable, grokNativeEnv } from './grok-models';
 import { MockAdapter, MockScript } from './adapters/mock';
 import type { AgentAdapter, AgentSessionHandle, AgentSessionOpts } from './adapters/types';
-import type { WorkbenchEvent, SessionRow, TaskScope, FileChangeInfo, SessionStatus, TaskUsageSummary, UsageField, UsageFieldCoverage, ProviderInfo, ModelProfile, MemoryKind, MemoryStatus } from '../shared/types';
+import type { WorkbenchEvent, SessionRow, TaskScope, FileChangeInfo, SessionStatus, TaskUsageSummary, UsageField, UsageFieldCoverage, ProviderInfo, ModelProfile, MemoryKind, MemoryStatus, PermissionContext } from '../shared/types';
+import { validateScopeInput, normalizeScope, parseScopeJson, deriveChildScope, scopeFingerprintPart, scopeSummary } from '../shared/scope';
+import type { ScopeSource } from '../shared/types';
+import { extractTargetPaths, isInsideDir, classifyBashInput, canonicalReadRoots, classifyReadInput } from './policy';
 import {
   isGitRepo, createWorktree, removeWorktree, worktreeApply, worktreeMergeCheck,
   gitStatusChanges, WriteConflictGuard, canonicalPath, buildBackgroundSnapshot,
@@ -30,12 +35,34 @@ export interface Settings {
 const DEFAULT_SETTINGS: Settings = { taskTimeoutSec: 900, maxConcurrentSubtasks: 2, maxDelegationsPerTask: 20 };
 
 const WORKBENCH_TOOLS = [
-  'delegate_task', 'list_subtasks', 'read_task_result', 'append_task_message', 'cancel_task', 'get_task_events',
+  'delegate_task', 'list_subtasks', 'read_task_result', 'append_task_message', 'cancel_task', 'get_task_events', 'run_isolated_check',
 ] as const;
 
 const FILE_WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 const FILE_READ_TOOLS = new Set(['Read', 'Glob', 'Grep', 'LS']);
+const NETWORK_TOOLS = new Set(['WebFetch', 'WebSearch', 'web_search']);
+const BOOKKEEPING_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TodoRead']);
 const EXTERNAL_AGENTS = new Set(['grok', 'dsh', 'zcode']);
+
+// 逻辑待授权记录：同一原生工具调用（callKey）的协议重试共用一条记录与决定。
+interface PendingPermission {
+  permissionId: string;
+  sessionId: string;
+  toolName: string;
+  input: any;
+  inputHash: string;      // 完整输入指纹：callKey 相同但输入变化 → 拒绝，不共用决定
+  callKey: string | null; // `${sessionId}:${toolUseId}`；执行器未提供 ID 时为 null
+  reason: string;         // 为何超出自动放行范围（展示给用户）
+  toolUseId: string | null;
+  createdAt: string;
+  resolve: (r: { behavior: 'allow' | 'deny'; message?: string }) => void;
+  thenable: Promise<{ behavior: 'allow' | 'deny'; message?: string }>;
+  settled: boolean;
+}
+
+// 已决调用的决定缓存（运行期）：同 callKey+input 的协议重试直接复用决定，
+// 拒绝后重试不再打扰用户；容量上限防止长会话膨胀。
+const RESOLVED_CALL_LIMIT = 400;
 
 interface Runtime {
   handle: AgentSessionHandle;
@@ -58,12 +85,18 @@ export interface DelegateResult {
 }
 
 export class TaskService {
+  private isolatedChecks = new Map<string, Promise<any>>();
+  private isolatedCheckControllers = new Map<string, Set<AbortController>>();
   private runtimes = new Map<string, Runtime>();
   private runtimeGeneration = new Map<string, number>();
   private runtimeLocks = new Map<string, Promise<void>>();
-  private pendingPermissions = new Map<string, {
-    sessionId: string; toolName: string; input: any; createdAt: string; resolve: (r: { behavior: 'allow' | 'deny'; message?: string }) => void;
-  }>();
+  // 待授权：permissionId → 逻辑记录；pendingByCall：callKey → 同一条记录（协议重试去重）
+  private pendingPermissions = new Map<string, PendingPermission>();
+  private pendingByCall = new Map<string, PendingPermission>();
+  // 已决调用决定：callKey → {inputHash, decision}（拒绝后重试不重复打扰；授权不对新调用生效）
+  private resolvedCalls = new Map<string, { inputHash: string; decision: 'allow' | 'deny' }>();
+  // 无原生调用 ID 的执行器：并发期相同（工具+完整输入）合并为一条待授权
+  private pendingByContent = new Map<string, PendingPermission>();
   private writeGuards = new Map<string, WriteConflictGuard>();   // canonical cwd → guard（worktree 相互隔离）
   private writeLocks = new Map<string, string>();                // projectId → 占用者 sessionId（非 git 单写者）
   private notificationSeq = 0;
@@ -71,6 +104,8 @@ export class TaskService {
   private shutdownPromise: Promise<void> | null = null;
   private mockScripts = new Map<string, MockScript>();
   broadcast: (e: WorkbenchEvent) => void = () => {};
+  // 每条新逻辑待授权提醒一次（main.ts 注入 Electron 系统通知；测试注入收集器）
+  permissionNotifier: ((info: { taskId: string; title: string; agentId: string; toolName: string; reason: string; permissionId: string }) => void) | null = null;
 
   readonly waiter: TaskWaiter;
   readonly modelCatalog: ModelCatalog;
@@ -163,12 +198,12 @@ export class TaskService {
   importModelProfiles() { return this.modelCatalog.importAvailable(); }
   saveCredentialSource(input: LocalSourceInput) {
     const source = this.credentials.saveLocalSource(input);
-    this.modelCatalog.importAvailable();
+    this.modelCatalog.importAvailable([source.providerId]);
     if (!this.store.getKV('defaultProviderId')) this.store.setKV('defaultProviderId', source.providerId);
     return source;
   }
   importCcSwitchCredential(providerId: string) {
-    if (!providerId || providerId.startsWith('workbench-local:') || providerId.startsWith('grok-'))
+    if (!providerId || providerId.startsWith('workbench-local:') || providerId.startsWith('native:') || providerId.startsWith('grok-'))
       throw new Error('请选择 CC Switch 凭据来源');
     return this.store.transaction(() => {
       const original = this.credentials.listProviderInfos().find((item) => item.providerId === providerId);
@@ -211,6 +246,39 @@ export class TaskService {
     });
   }
   deleteCredentialSource(providerId: string) { this.credentials.deleteLocalSource(providerId); return { deleted: providerId }; }
+
+  scanConfiguration() {
+    const discovery = discoverConfiguration();
+    const grok = discovery.agents.find(a => a.id === 'grok');
+    // Reading configured model IDs is enough for discovery; never launch a CLI
+    // just to show the installation preview.
+    const sources = [...this.credentials.listProviderInfos(), ...listGrokConfigProviders({
+      ...(grok?.configPath ? { grokHome: path.dirname(grok.configPath) } : {}),
+      listModels: () => discovery.models.filter(m => m.source === 'grok').map(m => `- ${m.model}`).join('\n'),
+    })].filter(s => s.model);
+    for (const source of sources) discovery.models.push({
+      id: `provider:${source.providerId}:${source.model}`, name: source.name, model: source.model,
+      source: '可执行模型配置', path: source.providerId === 'native:claude' ? 'Claude Code settings.json'
+        : source.providerId.startsWith('workbench-local:') ? 'Workbench 本地凭据'
+        : source.providerId.startsWith('grok-') ? 'Grok 本地配置' : 'CC Switch 本地配置',
+      protocol: source.providerId.startsWith('grok-') ? 'unknown' : 'anthropic', importable: true,
+    });
+    const fingerprint = crypto.createHash('sha256').update(JSON.stringify(discovery)).digest('hex');
+    return { ...discovery, fingerprint };
+  }
+
+  importConfiguration(confirmed: boolean, fingerprint: string) {
+    if (confirmed !== true) throw new Error('导入需要用户明确确认');
+    const scan = this.scanConfiguration();
+    if (fingerprint !== scan.fingerprint) throw new Error('检测结果已变化，请重新扫描并确认');
+    const sources = this.modelCatalog.sourceOptions().filter(s =>
+      scan.models.some(m => m.importable && m.id === `provider:${s.providerId}:${s.model}`));
+    const imported = this.modelCatalog.importAvailable(sources.map(s => s.providerId));
+    // Native controller metadata is useful without pretending it is an executable binding.
+    this.store.setKV('discoveredConfiguration.v1', JSON.stringify(scan));
+    return { ...imported, agents: scan.agents.length,
+      controllerModels: scan.models.filter(m => !m.importable).length };
+  }
 
   setDefaultTaskCombo(agentId: string, providerId: string, model: string) {
     const selected = this.agentOptions().combinations.find((combo) => combo.agentId === agentId
@@ -284,8 +352,7 @@ export class TaskService {
     if (!task) throw new Error('任务不存在');
     if (task.kind !== 'main' && task.kind !== 'sub') throw new Error('任务类型不支持交接');
     if (!['idle','completed'].includes(task.status)) throw new Error(`任务状态为${task.status}，不能生成成功交接草稿`);
-    const resultEvent = this.store.listEvents(taskId).filter((event) => event.type === 'result' && event.payload?.isError === false)
-      .slice(-1)[0];
+    const resultEvent = this.store.latestSuccessfulResult(taskId);
     if (!resultEvent || typeof resultEvent.payload?.text !== 'string' || !resultEvent.payload.text.trim())
       throw new Error('任务没有可用的成功结果事件，无法生成交接草稿');
     const body = `Agent 报告，待核对\n\n${resultEvent.payload.text.slice(0,19500)}`;
@@ -296,12 +363,23 @@ export class TaskService {
 
   // ---- 会话创建 ----
   createMainSession(input: {
-    projectId: string; title: string; prompt?: string; scope?: TaskScope;
+    projectId: string; title: string; prompt?: string; scope?: TaskScope | Record<string, unknown>;
+    scopeSource?: ScopeSource;
     agentId?: string; model?: string; providerId?: string; mockScript?: string; background?: string; clientRequestId?: string;
   }): SessionRow {
     const requestKey = input.clientRequestId ? `create:${input.projectId}:${input.clientRequestId}` : null;
     if (input.clientRequestId && input.clientRequestId.length>200) throw new Error('请求 ID 过长');
-    const fingerprint = JSON.stringify([input.projectId,input.title,input.prompt??'',input.agentId??'claude-code',input.model??null,input.providerId??null,input.scope?.fileWrite??true,input.background??'',input.mockScript??null]);
+    // 范围在创建入口统一校验：未知字段/类型不符直接报错，不做静默修正。
+    // 未传 scope 的直接调用保持既有默认（fileWrite=true，bash/network 最严格）；
+    // MCP/control/UI 三个入口总是显式传入范围（默认全部最严格）。
+    const scopeCheck = input.scope === undefined
+      ? { ok: true as const, scope: normalizeScope({ fileWrite: true }) }
+      : validateScopeInput(input.scope);
+    if (!scopeCheck.ok) throw new Error(scopeCheck.error);
+    const scope = scopeCheck.scope;
+    if (scope.readRoots?.length) scope.readRoots = canonicalReadRoots(scope.readRoots);
+    // 幂等指纹包含完整范围（fileWrite/bash/network），范围不同即视为不同请求
+    const fingerprint = JSON.stringify([input.projectId,input.title,input.prompt??'',input.agentId??'claude-code',input.model??null,input.providerId??null,scopeFingerprintPart(scope),input.background??'',input.mockScript??null]);
     if (requestKey) {
       const prior=this.store.getKV(requestKey);
       if (prior) { const record=JSON.parse(prior); if(record.fingerprint!==fingerprint) throw new Error('相同请求 ID 的参数不一致'); return this.store.getSession(record.taskId)!; }
@@ -310,6 +388,8 @@ export class TaskService {
     const project = this.store.getProject(input.projectId);
     if (!project) throw new Error('项目不存在');
     const agentId = input.agentId ?? 'claude-code';
+    if (scope.isolatedChecks && agentId !== 'claude-code')
+      throw new Error('隔离构建/测试工具目前仅支持 Claude Code；其他 Agent 的 Bash 仍逐条请求确认');
     const isMock = agentId === 'mock';
     if (agentId !== 'claude-code' && !EXTERNAL_AGENTS.has(agentId) && !(isMock && input.mockScript && this.mockScripts.has(input.mockScript))) throw new Error('执行器未接入');
     // 供应商解析：显式指定 > 此 Agent 保存的模型 > CC Switch 默认。
@@ -338,13 +418,16 @@ export class TaskService {
     if (!isMock && !this.isSupportedCombination(agentId, providerId, model))
       throw new Error(`${agentId} 的模型与供应商组合无效；请从模型配置中选择，不会回退到其他模型或端点`);
     const id = crypto.randomUUID();
-    const scope = input.scope ?? { fileWrite: true };
+    const scopeSource: ScopeSource = input.scopeSource ?? 'legacy';
     const session=this.store.transaction(() => {
     this.store.createSession({
       id, projectId: input.projectId, kind: 'main', parentSessionId: null, title: input.title,
-      agentId, model, cwd: project.rootPath, scope, providerId,
+      agentId, model, cwd: project.rootPath, scope, scopeSource, providerId,
       delegation: null,
     });
+    // 范围快照：创建时刻的完整授权与来源进入事件流（append-only，可审计）
+    const scopeEv = this.store.appendEvent(id, 'scope', { scope, source: scopeSource, text: `任务授权范围（来源 ${scopeSource}）：${scopeSummary(scope)}` });
+    this.broadcast(scopeEv);
     const profile = this.modelCatalog.find(providerId, model);
     if (profile) this.store.setKV(`modelProfile:${id}`, JSON.stringify({
       id: profile.id, reasoningLevel: profile.reasoningLevel ?? null, sourceFingerprint: profile.sourceFingerprint ?? null,
@@ -479,7 +562,7 @@ export class TaskService {
     }
     const rt0 = this.runtimes.get(sessionId);
     if (rt0) rt0.lastUserText = text;
-    const priorUserMessage = this.store.listEvents(sessionId).some((event) => event.type === 'message' && event.payload?.role === 'user');
+    const priorUserMessage = this.store.hasUserMessage(sessionId);
     if (!priorUserMessage) {
       const raw=this.store.getKV(`background:${sessionId}`);
       const bg = raw ? JSON.parse(raw) : null;
@@ -489,8 +572,9 @@ export class TaskService {
       if (injection.entries.length) sections.push(`${MEMORY_CONTEXT_HEADER}${injection.entries.map((entry) => entry.injectedText).join('\n\n')}`);
       if (sections.length) text=`${sections.join('\n\n')}\n\n本次要求：\n${text}`;
     }
-    this.store.appendEvent(sessionId, 'message', { role: 'user', text });
-    this.broadcast(this.store.listEvents(sessionId).slice(-1)[0]);
+    const userEvent = this.store.appendEvent(sessionId, 'message', { role: 'user', text });
+    this.broadcast(userEvent);
+    this.newTurn(sessionId);   // 新回合：不复用旧回合的同 ID 决定
     try {
       await this.ensureRuntime(session, text);
     } catch (e: any) {
@@ -509,15 +593,9 @@ export class TaskService {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false };
     const rt = this.runtimes.get(sessionId);
-    // 拒绝所有待授权：取消后不再执行任何工具
-    for (const [pid, p] of this.pendingPermissions) {
-      if (p.sessionId === sessionId) {
-        p.resolve({ behavior: 'deny', message: '任务已停止' });
-        this.pendingPermissions.delete(pid);
-        const ev = this.store.appendEvent(sessionId, 'permission_resolved', { permissionId: pid, decision: 'deny', reason: '任务已停止' });
-        this.broadcast(ev);
-      }
-    }
+    for (const controller of this.isolatedCheckControllers.get(sessionId) ?? []) controller.abort();
+    // 拒绝所有待授权：取消后不再执行任何工具；旧 permissionId 随记录清除，不能再放行
+    this.settlePendingPermissions(sessionId, '任务已停止', 'deny', { refreshStatus: false });
     if (rt) {
       rt.closing = rt.handle.interrupt().then(() => rt.handle.close()).then(() => {
         rt.closed = true;
@@ -551,62 +629,334 @@ export class TaskService {
   }
 
   // ---- 授权 ----
+  get pendingPermissionCount(): number { return this.pendingPermissions.size; }
+
   listPendingPermissions(taskId: string) {
     if (!this.store.getSession(taskId)) return { ok: false, error: '任务不存在' };
     return { ok: true, permissions: [...this.pendingPermissions].filter(([,p]) => p.sessionId === taskId)
-      .map(([permissionId,p]) => ({permissionId, taskId, toolName:p.toolName, input:p.input, createdAt:p.createdAt})) };
+      .map(([permissionId,p]) => ({permissionId, taskId, toolName:p.toolName, input:p.input, reason:p.reason, toolUseId:p.toolUseId, createdAt:p.createdAt})) };
   }
 
-  respondPermission(permissionId: string, decision: 'allow' | 'deny', taskId?: string) {
+  async runIsolatedCheck(taskId: string, command: string, requestedImage?: string): Promise<{ ok: boolean; exitCode?: number; output?: string; cached?: boolean; error?: string }> {
+    const session = this.store.getSession(taskId);
+    if (!session || !['running', 'waiting_permission', 'resuming'].includes(session.status))
+      return { ok: false, error: '任务没有正在执行的会话' };
+    const checks = parseScopeJson(session.scopeJson).isolatedChecks;
+    const image = requestedImage ?? checks?.image;
+    if (!image || !/^sha256:[a-f0-9]{64}$/.test(image) || typeof command !== 'string' || !command.trim()
+      || command.length > 500 || /[\r\n\0]/.test(command))
+      return { ok: false, error: '请提供完整本地镜像 sha256 ID 与单行命令' };
+    const snapshot = await makeSnapshot(session.cwd);
+    if (this.shuttingDown || !['running', 'waiting_permission', 'resuming'].includes(this.store.getSession(taskId)?.status ?? '')) {
+      await removeSnapshot(snapshot.directory);
+      return { ok: false, error: '任务已停止，隔离检查未运行' };
+    }
+    const key = `isolated:${crypto.createHash('sha256').update(image).update('\0').update(command)
+      .update('\0').update(snapshot.digest).digest('hex')}`;
+    const containerName = `wb-check-${taskId}-${key.slice(-16)}`;
+    const existing = this.isolatedChecks.get(`${taskId}:${key}`);
+    if (existing) {
+      await removeSnapshot(snapshot.directory);
+      return { ...(await existing), cached: true };
+    }
+    const prior = this.store.getToolResult(taskId, key);
+    if (prior !== undefined) {
+      await removeSnapshot(snapshot.directory);
+      if (prior !== null) return { ...prior, cached: true };
+      await stopIsolatedContainer(containerName);
+      return { ok: false, error: '上次隔离检查启动后结果未知；已停止遗留容器，同一代码快照不会自动重复执行' };
+    }
+    if (checks?.image !== image || !checks.commands.includes(command)) {
+      let decision: { behavior: 'allow' | 'deny'; message?: string };
+      try {
+        decision = await this.requestPermission(session, 'IsolatedCheck',
+          { command, image, snapshot: snapshot.digest, files: snapshot.files }, undefined,
+          '该镜像或命令不在任务已授权的隔离检查清单中，需用户确认一次执行');
+      } catch (error) { await removeSnapshot(snapshot.directory); throw error; }
+      if (decision.behavior !== 'allow') {
+        await removeSnapshot(snapshot.directory);
+        return { ok: false, error: decision.message ?? '用户拒绝了该检查' };
+      }
+    }
+    if (this.shuttingDown || !['running', 'waiting_permission', 'resuming'].includes(this.store.getSession(taskId)?.status ?? '')) {
+      await removeSnapshot(snapshot.directory);
+      return { ok: false, error: '任务已停止，隔离检查未运行' };
+    }
+    const running = this.isolatedChecks.get(`${taskId}:${key}`);
+    if (running) { await removeSnapshot(snapshot.directory); return { ...(await running), cached: true }; }
+    let guard: { first: boolean; previous: any | null };
+    try {
+      const claimed = this.store.transaction(() => {
+        const result = this.store.firstRun(taskId, key);
+        return { guard: result, event: result.first ? this.store.appendEvent(taskId, 'tool_request', {
+          toolUseId: key, name: 'IsolatedCheck', input: { image, command, snapshot: snapshot.digest, files: snapshot.files },
+        }) : null };
+      });
+      guard = claimed.guard;
+      if (claimed.event) this.broadcast(claimed.event);
+    } catch (error: any) {
+      await removeSnapshot(snapshot.directory);
+      return { ok: false, error: `隔离检查启动记录未能持久化，未执行：${String(error?.message ?? error)}` };
+    }
+    if (!guard.first) {
+      await removeSnapshot(snapshot.directory);
+      if (guard.previous) return { ...guard.previous, cached: true };
+      await stopIsolatedContainer(containerName);
+      return { ok: false, error: '上次隔离检查启动后结果未知；已停止遗留容器，同一代码快照不会自动重复执行' };
+    }
+    const controller = new AbortController();
+    const controllers = this.isolatedCheckControllers.get(taskId) ?? new Set<AbortController>();
+    controllers.add(controller); this.isolatedCheckControllers.set(taskId, controllers);
+    const run = (async () => {
+      let result: { ok: boolean; exitCode?: number; output?: string; error?: string };
+      try {
+        const executed = await runIsolatedContainer(image, command, snapshot.directory, containerName, controller.signal);
+        result = { ok: executed.exitCode === 0, exitCode: executed.exitCode, output: executed.output };
+      } catch (error: any) {
+        result = { ok: false, error: String(error?.message ?? error) };
+      } finally {
+        await removeSnapshot(snapshot.directory);
+        controllers.delete(controller);
+        if (!controllers.size) this.isolatedCheckControllers.delete(taskId);
+      }
+      try {
+        const ev = this.store.transaction(() => {
+          this.store.completeTool(taskId, key, result);
+          return this.store.appendEvent(taskId, 'tool_result', {
+            toolUseId: key, name: 'IsolatedCheck', ok: result.ok,
+            brief: result.ok ? `检查通过，退出码 0` : `检查失败：${result.error ?? `退出码 ${result.exitCode}`}`,
+          });
+        });
+        this.broadcast(ev);
+      } catch { return { ok: false, error: '隔离检查结果未能持久化，请查看任务事件；不会自动重复执行' }; }
+      return result;
+    })();
+    this.isolatedChecks.set(`${taskId}:${key}`, run);
+    try { return await run; }
+    finally { this.isolatedChecks.delete(`${taskId}:${key}`); }
+  }
+
+  // 决定落盘先于返回执行器：appendEvent 提交后 resolve，保证"事件流里已有决定"时
+  // 执行器才拿到放行。落盘失败（存储关闭/磁盘满）时不得丢失待办或悬挂执行器回调：
+  // 保守按"拒绝"返回执行器并记录错误，记录先于 resolve。
+  respondPermission(permissionId: string, decision: 'allow' | 'deny', taskId?: string, source: 'ui' | 'control' | 'internal' = 'internal') {
     if (decision !== 'allow' && decision !== 'deny') return { ok:false, error:'无效授权决定' };
     const p = this.pendingPermissions.get(permissionId);
     if (!p) return { ok: false, error:'授权请求已处理或不存在' };
     if (taskId && p.sessionId !== taskId) return { ok:false, error:'授权请求与任务不匹配' };
-    this.pendingPermissions.delete(permissionId);
-    p.resolve(decision === 'allow' ? { behavior: 'allow' } : { behavior: 'deny', message: '用户拒绝了该操作' });
-    const ev = this.store.appendEvent(p.sessionId, 'permission_resolved', { permissionId, decision });
-    this.broadcast(ev);
-    const s = this.store.getSession(p.sessionId);
-    if (s && s.status === 'waiting_permission' && ![...this.pendingPermissions.values()].some(x=>x.sessionId===p.sessionId)) {
-      this.setStatus(p.sessionId, 'running');
-      this.armTimer(p.sessionId);
+    this.removePending(p);
+    const reason = decision === 'allow' ? undefined : '用户拒绝了该操作';
+    let persisted = true;
+    let ev: WorkbenchEvent | null = null;
+    try {
+      ev = this.store.appendEvent(p.sessionId, 'permission_resolved', { permissionId, decision, reason, source });
+    } catch (e: any) {
+      persisted = false;
+      console.error(`[perm] 决定落盘失败（${e?.message ?? e}），按拒绝处理以防越权执行`);
     }
-    return { ok: true };
+    if (ev) try { this.broadcast(ev); } catch (e: any) {
+      console.error(`[perm] 授权决定已落盘，但界面广播失败（${e?.message ?? e}）`);
+    }
+    this.rememberResolved(p, persisted ? decision : 'deny');
+    p.resolve(persisted ? (decision === 'allow' ? { behavior: 'allow' } : { behavior: 'deny', message: reason })
+      : { behavior: 'deny', message: '授权决定未能持久化，已按拒绝处理；请重新发起该操作' });
+    // 待办已结清、执行器已拿到（拒绝）结果：状态刷新是展示层的尽力而为，不再让落盘故障外抛
+    try { this.refreshPermissionStatus(p.sessionId); } catch (e: any) {
+      console.error(`[perm] 状态刷新失败（${e?.message ?? e}）`);
+    }
+    return { ok: true, persisted };
   }
 
-  private async requestPermission(session: SessionRow, toolName: string, input: any): Promise<{ behavior: 'allow' | 'deny'; message?: string }> {
+  private rememberResolved(p: PendingPermission, decision: 'allow' | 'deny') {
+    if (!p.callKey) return;
+    this.resolvedCalls.set(p.callKey, { inputHash: p.inputHash, decision });
+    if (this.resolvedCalls.size > RESOLVED_CALL_LIMIT) {
+      const oldest = this.resolvedCalls.keys().next().value;
+      if (oldest) this.resolvedCalls.delete(oldest);
+    }
+  }
+
+  // 新回合开始：执行器（如 ZCode）可能在不同回合复用 toolCallId，清理决定缓存，
+  // 防止旧回合的批准被同 ID 的新调用误用。协议重试发生在同一回合内，不受影响。
+  private newTurn(sessionId: string) {
+    for (const key of [...this.resolvedCalls.keys()]) {
+      if (key.startsWith(`${sessionId}:`)) this.resolvedCalls.delete(key);
+    }
+  }
+
+  private removePending(p: PendingPermission) {
+    p.settled = true;
+    this.pendingPermissions.delete(p.permissionId);
+    if (p.callKey && this.pendingByCall.get(p.callKey) === p) this.pendingByCall.delete(p.callKey);
+    const contentKey = this.contentKey(p.sessionId, p.toolName, p.input);
+    if (contentKey && this.pendingByContent.get(contentKey) === p) this.pendingByContent.delete(contentKey);
+  }
+
+  private contentKey(sessionId: string, toolName: string, input: any): string | null {
+    try { return `content:${sha1(sessionId + '|' + toolName + '|' + JSON.stringify(input ?? null))}`; }
+    catch { return null; } // 循环引用等无法序列化的输入不去重
+  }
+
+  // 把任务的全部待授权按给定决定结清（取消/执行器退出/关停/恢复共用）。
+  // 结清的记录立即从映射中移除：旧 permissionId 不能再被放行。
+  // refreshStatus=false 时不动状态（调用方随后自行写终态，避免中间态噪音）。
+  private settlePendingPermissions(sessionId: string, reason: string, decision: 'deny' | 'invalidated',
+      opts?: { refreshStatus?: boolean }) {
+    for (const p of [...this.pendingPermissions.values()]) {
+      if (p.sessionId !== sessionId) continue;
+      this.removePending(p);
+      if (decision === 'deny') this.rememberResolved(p, 'deny');
+      try {
+        const ev = this.store.appendEvent(sessionId, 'permission_resolved', { permissionId: p.permissionId, decision, reason });
+        this.broadcast(ev);
+      } catch (e: any) {
+        console.error(`[perm] 结清事件落盘失败（${e?.message ?? e}）；执行器回调按拒绝释放`);
+      }
+      p.resolve({ behavior: 'deny', message: reason });
+    }
+    if (opts?.refreshStatus !== false) {
+      try { this.refreshPermissionStatus(sessionId); } catch (e: any) {
+        console.error(`[perm] 状态刷新失败（${e?.message ?? e}）`);
+      }
+    }
+  }
+
+  // waiting_permission 只在仍有真实待授权回调时展示；最后一条结清后回到运行态
+  private refreshPermissionStatus(sessionId: string) {
+    const s = this.store.getSession(sessionId);
+    if (!s) return;
+    const hasPending = [...this.pendingPermissions.values()].some((p) => p.sessionId === sessionId);
+    if (hasPending) {
+      if (s.status !== 'waiting_permission') this.setStatus(sessionId, 'waiting_permission');
+      return;
+    }
+    if (s.status === 'waiting_permission') {
+      this.setStatus(sessionId, 'running');
+      this.armTimer(sessionId);
+    }
+  }
+
+  private inputFingerprint(toolName: string, input: any): string {
+    try { return sha1(toolName + '|' + JSON.stringify(input ?? null)); }
+    catch { return sha1(toolName + '|<unserializable>'); }
+  }
+
+  // 创建（或复用）一条逻辑待授权。去重规则：
+  //   1) 同 callKey（原生工具调用 ID）+ 相同完整输入的协议重试 → 共用同一记录与决定；
+  //   2) 同 callKey 但输入变化（待决或已决阶段）→ 立即拒绝（协议错误，不向用户展示）；
+  //   3) 已决 callKey 的重试 → 直接复用已落盘决定（拒绝后重试不再打扰；allow 重放不产生新执行）；
+  //   4) 不同 callKey（文本相同的新调用）→ 新待授权，一次批准只对一次执行有效；
+  //   5) 执行器未提供 ID（mock 等）→ 并发期相同（工具+输入）内容合并，否则逐条请求。
+  // callKey 缓存的作用域：回合内 + 当前 runtime 世代（见 newTurn/retireRuntime 的清理），
+  // 保证跨回合或执行器重建后的同 ID 调用不会被旧批准误放行。
+  private async requestPermission(session: SessionRow, toolName: string, input: any,
+      ctx?: PermissionContext, reason = '超出任务授权范围'): Promise<{ behavior: 'allow' | 'deny'; message?: string }> {
+    const toolUseId = typeof ctx?.toolUseId === 'string' && ctx.toolUseId ? ctx.toolUseId : null;
+    const callKey = toolUseId ? `${session.id}:${toolUseId}` : null;
+    const inputHash = this.inputFingerprint(toolName, input);
+
+    if (callKey) {
+      const pending = this.pendingByCall.get(callKey);
+      if (pending) {
+        if (pending.inputHash !== inputHash)
+          return { behavior: 'deny', message: '同一调用 ID 的输入发生变化，已拒绝；如需执行请新发起调用' };
+        return pending.thenable;
+      }
+      const resolved = this.resolvedCalls.get(callKey);
+      if (resolved) {
+        // 已决后同 ID 任何形态的重试都不再打扰用户；输入已变则拒绝，不共用旧批准
+        return resolved.inputHash === inputHash && resolved.decision === 'allow' ? { behavior: 'allow' }
+          : { behavior: 'deny', message: resolved.inputHash !== inputHash
+            ? '同一调用 ID 的输入与已决请求不一致，已拒绝；如需执行请新发起调用'
+            : '该操作此前已被拒绝；重试不重复请求授权' };
+      }
+    } else {
+      const contentKey = this.contentKey(session.id, toolName, input);
+      const pending = contentKey ? this.pendingByContent.get(contentKey) : undefined;
+      if (pending) return pending.thenable;
+    }
+
     const permissionId = crypto.randomUUID();
     this.clearTimer(session.id);
-    return new Promise((resolve) => {
-      this.pendingPermissions.set(permissionId, { sessionId:session.id, toolName, input, createdAt:new Date().toISOString(), resolve });
+    let resolve!: (r: { behavior: 'allow' | 'deny'; message?: string }) => void;
+    const thenable = new Promise<{ behavior: 'allow' | 'deny'; message?: string }>((r) => { resolve = r; });
+    const record: PendingPermission = {
+      permissionId, sessionId: session.id, toolName, input, inputHash, callKey, reason, toolUseId,
+      createdAt: new Date().toISOString(), resolve, thenable, settled: false,
+    };
+    this.pendingPermissions.set(permissionId, record);
+    if (callKey) this.pendingByCall.set(callKey, record);
+    else {
+      const contentKey = this.contentKey(session.id, toolName, input);
+      if (contentKey) this.pendingByContent.set(contentKey, record);
+    }
+    let ev: WorkbenchEvent;
+    try {
       this.setStatus(session.id, 'waiting_permission');
-      const ev = this.store.appendEvent(session.id, 'permission_request', { permissionId, toolName, input });
-      this.broadcast(ev);
-    });
+      ev = this.store.appendEvent(session.id, 'permission_request', {
+        permissionId, toolName, input, reason, toolUseId, callKey,
+      });
+    } catch (e: any) {
+      this.removePending(record);
+      record.resolve({ behavior: 'deny', message: '授权请求未能持久化，已拒绝该操作' });
+      try { this.refreshPermissionStatus(session.id); } catch { /* 存储仍不可用时等待恢复流程修正状态 */ }
+      console.error(`[perm] 请求落盘失败（${e?.message ?? e}），已拒绝该操作`);
+      return thenable;
+    }
+    try { this.broadcast(ev); } catch (e: any) {
+      console.error(`[perm] 授权请求已落盘，但界面广播失败（${e?.message ?? e}）`);
+    }
+    try { this.permissionNotifier?.({ taskId: session.id, title: session.title, agentId: session.agentId,
+      toolName, reason, permissionId }); } catch { /* 通知失败不阻塞授权流程 */ }
+    return thenable;
   }
 
-  // 范围授权策略：项目内读自动允许；项目内写按任务 scope；其余一律询问用户
-  private async policyCheck(session: SessionRow, toolName: string, input: any): Promise<{ behavior: 'allow' | 'deny'; message?: string }> {
+  // 范围授权策略：检查规范化后的工作目录、全部目标路径与实际工具输入。
+  //   - Workbench 自有工具、任务簿记工具 → 自动允许（无外部副作用）；
+  //   - 项目内读（含多路径/Glob/Grep 的 path 参数，realpath 规范化防符号链接逃逸）→ 自动允许；
+  //   - 项目内写 → 按任务 scope.fileWrite（写入冲突守卫继续生效）；
+  //   - Bash → scope.bash=readonly 时仅严格只读/指纹命令自动放行，其余逐条请求；
+  //   - 网络工具 → 按任务 scope.network；
+  //   - 其余一律请求确认；mock 会话仅用于测试，保持放行。
+  private async policyCheck(session: SessionRow, toolName: string, input: any,
+      ctx?: PermissionContext): Promise<{ behavior: 'allow' | 'deny'; message?: string }> {
     const dbg = (msg: string) => { if (process.env.WORKBENCH_DEBUG) console.error(`[perm] ${toolName} ${msg}`); };
     dbg(`input=${JSON.stringify(input).slice(0, 120)}`);
     if (session.agentId === 'mock') return { behavior: 'allow' };
     if (WORKBENCH_TOOLS.some((tool) => toolName === `mcp__workbench__${tool}` || toolName === `workbench__${tool}`))
       return { behavior: 'allow' };
-    const rawTarget: string | undefined = input?.file_path ?? input?.filePath ?? input?.notebook_path ?? input?.path
-      ?? (Array.isArray(input?.edits) ? input.edits[0]?.file_path ?? input?.file_path : undefined);
-    const targetPath = typeof rawTarget === 'string' ? path.resolve(session.cwd, rawTarget) : undefined;
+    if (BOOKKEEPING_TOOLS.has(toolName)) return { behavior: 'allow' };
+    const scope = parseScopeJson(session.scopeJson);
+    if (toolName === 'Bash' || toolName === 'bash' || toolName.endsWith('__Bash')) {
+      const { decision } = classifyBashInput(input, session.cwd);
+      if (scope.bash === 'readonly' && decision.kind === 'allow') {
+        dbg(`bash readonly auto-allow: ${decision.rule}`);
+        return { behavior: 'allow' };
+      }
+      const askReason = decision.kind === 'ask'
+        ? decision.reason
+        : `命令（${decision.rule}）只读，但任务范围未授予 Bash 自动放行`;
+      return this.requestPermission(session, toolName, input, ctx, askReason);
+    }
+    if (NETWORK_TOOLS.has(toolName)) {
+      if (scope.network) return { behavior: 'allow' };
+      return this.requestPermission(session, toolName, input, ctx, '任务未授予网络访问（scope.network=false）');
+    }
+    const targets = extractTargetPaths(toolName, input).map((raw) => path.resolve(session.cwd, raw));
     if (FILE_READ_TOOLS.has(toolName)) {
-      if (!targetPath) return { behavior: 'allow' };              // Glob/Grep 的 pattern 形式
-      return isInsideDir(session.cwd, targetPath) ? { behavior: 'allow' } : this.requestPermission(session, toolName, input);
+      const decision = classifyReadInput(toolName, input, session.cwd, scope.readRoots);
+      return decision.kind === 'allow' ? { behavior: 'allow' }
+        : this.requestPermission(session, toolName, input, ctx, decision.reason);
     }
     if (FILE_WRITE_TOOLS.has(toolName)) {
-      const inCwd = targetPath ? isInsideDir(session.cwd, targetPath) : false;
-      const scope: TaskScope = JSON.parse(session.scopeJson || '{}');
-      if (inCwd && scope.fileWrite) {
-        dbg(`inCwd=${inCwd} scope=${scope.fileWrite} -> allow`);
+      if (targets.length === 0)
+        return this.requestPermission(session, toolName, input, ctx, '无法识别写入目标路径，不能按项目内写入自动放行');
+      const outside = targets.find((t) => !isInsideDir(session.cwd, t));
+      if (!outside && scope.fileWrite) {
+        dbg(`write in-cwd scope=true -> allow`);
         const guard = this.writeGuards.get(canonicalPath(session.cwd));
-        if (guard && targetPath) {
-          const rel = path.relative(session.cwd, targetPath);
+        if (guard && targets[0]) {
+          const rel = path.relative(session.cwd, targets[0]);
           const check = guard.checkBeforeWrite(rel);
           if (!check.ok) {
             const ev = this.store.appendEvent(session.id, 'conflict', { kind: 'write', path: rel, detail: check.reason });
@@ -616,10 +966,12 @@ export class TaskService {
         }
         return { behavior: 'allow' };
       }
-      return this.requestPermission(session, toolName, input);
+      return this.requestPermission(session, toolName, input, ctx,
+        outside ? '写入目标在项目目录之外' : '任务未授予项目内写文件（scope.fileWrite=false）');
     }
-    if (toolName === 'TodoWrite' || toolName === 'TaskCreate' || toolName === 'TaskUpdate') return { behavior: 'allow' };
-    return this.requestPermission(session, toolName, input);     // Bash、网络等需用户授权
+    // 其余工具（含构建/测试等 Bash 变体之外的一切）默认人工确认：
+    // 当前没有可核验的进程级边界（SDK sandbox 凭据 env 继承未验证），不做"脚本名可读=安全"的推断
+    return this.requestPermission(session, toolName, input, ctx, '工具不在自动放行范围，需人工确认');
   }
 
   // ---- 运行时 ----
@@ -676,6 +1028,7 @@ export class TaskService {
     }
     const resumeNative = session.nativeSessionId;
     if (!rt) {
+      if (session.agentId !== 'mock') firstText = `任务授权范围：${scopeSummary(parseScopeJson(session.scopeJson))}。\n对应文件工具可用时，读取优先用 Read/Grep/Glob/LS，项目文件修改优先用 Edit/Write；缺少工具时，Bash 仍须按任务范围核验授权。额外只读目录不授予写入或 Bash 权限。\n\n${firstText}`;
       const adapter = this.adapterFor(session);
       const env = this.buildEnv(session) ?? {};
       const opts: AgentSessionOpts = {
@@ -686,7 +1039,10 @@ export class TaskService {
         model: session.model,
         reasoningLevel: this.modelCatalog.find(session.providerId ?? '', session.model)?.reasoningLevel,
         env,
-        canUseTool: (toolName, input) => this.policyCheck(session, toolName, input),
+        ...(session.agentId === 'claude-code' && parseScopeJson(session.scopeJson).isolatedChecks ? {
+          systemPromptAppend: `本任务已授权的隔离检查命令：${parseScopeJson(session.scopeJson).isolatedChecks!.commands.join('；')}。构建或测试请调用 mcp__workbench__run_isolated_check，并传入清单中的精确命令。普通 Bash 不会因此获得宿主执行授权。`,
+        } : {}),
+        canUseTool: (toolName, input, ctx) => this.policyCheck(session, toolName, input, ctx),
         resumeNativeSessionId: resumeNative ?? undefined,
         onEvent: (e) => this.onAdapterEvent(session.id, e),
         onEnd: (reason, error) => this.onAdapterEnd(session.id, reason, error),
@@ -700,15 +1056,22 @@ export class TaskService {
       if (this.shuttingDown) throw new Error('任务服务正在关闭，无法启动 Agent');
       const generation = (this.runtimeGeneration.get(session.id) ?? 0) + 1;
       this.runtimeGeneration.set(session.id, generation);
+      this.setStatus(session.id, resumeNative ? 'resuming' : 'running');
       const handle = adapter.start({ ...opts,
+        canUseTool: (toolName, input, ctx) => {
+          if (this.shuttingDown || this.runtimeGeneration.get(session.id) !== generation)
+            return Promise.resolve({ behavior: 'deny' as const, message: '执行器已失效或任务不在运行中' });
+          const current = this.store.getSession(session.id);
+          if (!current || !['running', 'waiting_permission', 'resuming'].includes(current.status))
+            return Promise.resolve({ behavior: 'deny' as const, message: '执行器已失效或任务不在运行中' });
+          return this.policyCheck(current, toolName, input, ctx);
+        },
         onEvent: (event) => { if (this.runtimeGeneration.get(session.id) === generation) this.onAdapterEvent(session.id, event); },
         onEnd: (reason, error) => { if (this.runtimeGeneration.get(session.id) === generation) this.onAdapterEnd(session.id, reason, error); },
       });
       rt = { handle, adapter, timer: null, recentToolInputs: new Map(), pendingTurn: true, resumeRetryPending: !!resumeNative, lastUserText: firstText };
       this.runtimes.set(session.id, rt);
       this.armTimer(session.id);
-      if (resumeNative) this.setStatus(session.id, 'resuming');
-      else this.setStatus(session.id, 'running');
     } else {
       rt.ended = false;
       this.armTimer(session.id);
@@ -719,6 +1082,9 @@ export class TaskService {
       rt.pendingTurn = false;
       await rt.handle.send(firstText);
     }
+    // 若上一回合遗留了仍真实的待授权（如恢复场景），状态回到 waiting_permission，
+    // 避免"running 但实际卡在授权"的错位展示
+    this.refreshPermissionStatus(session.id);
   }
 
   // Release execution resources, retaining the native session and durable history.
@@ -755,6 +1121,10 @@ export class TaskService {
 
   private retireRuntime(sessionId: string) {
     this.runtimeGeneration.set(sessionId, (this.runtimeGeneration.get(sessionId) ?? 0) + 1);
+    // 执行器重建后协议层可能复用 ID：旧世代的决定一律不再复用
+    for (const key of [...this.resolvedCalls.keys()]) {
+      if (key.startsWith(`${sessionId}:`)) this.resolvedCalls.delete(key);
+    }
   }
 
   private armTimer(sessionId: string) {
@@ -881,6 +1251,9 @@ export class TaskService {
     const session = this.store.getSession(sessionId);
     this.clearTimer(sessionId);
     if (!session) return;
+    // 执行器已退出：它持有的待授权回调不可能再被满足，全部结清，避免幽灵待办
+    // （结清决定先于状态迁移落盘，重放事件时顺序可解释）
+    this.settlePendingPermissions(sessionId, `执行器已退出（${reason}）`, 'deny', { refreshStatus: false });
     const current = this.store.getSession(sessionId)!;
     if (['completed', 'failed', 'stopped', 'canceled', 'timeout'].includes(current.status)) {
       // 终态已由 result/cancel 决定；done 的进程退出不改变状态
@@ -1001,7 +1374,8 @@ export class TaskService {
     let cwd = project.rootPath;
     let writeScope = false;
     let readOnlyNote = false;
-    const parentCanWrite = JSON.parse(parent.scopeJson || '{}').fileWrite === true;
+    const parentScope = parseScopeJson(parent.scopeJson);
+    const parentCanWrite = parentScope.fileWrite === true;
     if (project.isGit) {
       try { cwd = createWorktree(project.rootPath, subId); writeScope = parentCanWrite; readOnlyNote = !parentCanWrite; }
       catch (e: any) { return finalize({ ok: false, error: `worktree 创建失败: ${String(e.message).slice(0, 200)}` }); }
@@ -1016,6 +1390,8 @@ export class TaskService {
         this.writeLocks.set(project.id, subId);
       }
     }
+    // 子任务范围 = 父任务范围的子集（写入另受单写者约束；bash/network 只能继承或收窄）
+    const childScope = deriveChildScope(parentScope, writeScope);
     const facts = this.projectFacts(project.id);
     // 背景快照：委派时生成文件内容/版本与未提交补丁（子任务 worktree 看不到主树未提交改动）
     const snapshotFiles = Array.from(new Set([...(args.context_files ?? [])]));
@@ -1040,10 +1416,14 @@ export class TaskService {
 
     this.store.createSession({
       id: subId, projectId: project.id, kind: 'sub', parentSessionId, title: args.title,
-      agentId: parent.agentId, model: parent.model, cwd, scope: { fileWrite: writeScope },
+      agentId: parent.agentId, model: parent.model, cwd, scope: childScope, scopeSource: 'derived',
       providerId: parent.providerId,   // 子任务继承父任务的供应商与模型绑定
       delegation: { instructions: args.instructions, contextFiles: args.context_files, acceptance: args.acceptance, snapshot: snap.meta },
     });
+    {
+      const scopeEv = this.store.appendEvent(subId, 'scope', { scope: childScope, source: 'derived', text: `子任务授权范围（来源 derived，父任务 ${parent.id.slice(0, 8)}）：${scopeSummary(childScope)}` });
+      this.broadcast(scopeEv);
+    }
     const parentModelProfile = this.store.getKV(`modelProfile:${parentSessionId}`);
     if (parentModelProfile) this.store.setKV(`modelProfile:${subId}`, parentModelProfile);
     if (parent.agentId === 'mock') {
@@ -1060,10 +1440,11 @@ export class TaskService {
   readTaskResult(taskId: string): { ok: boolean; error?: string; result?: any } {
     const s = this.store.getSession(taskId);
     if (!s) return { ok: false, error: '任务不存在' };
-    const files: FileChangeInfo[] = this.store.listEvents(taskId)
+    const resultEvents = this.store.listEventsByTypes(taskId, ['file_change', 'usage']);
+    const files: FileChangeInfo[] = resultEvents
       .filter((e) => e.type === 'file_change')
       .map((e) => ({ path: e.payload.path, change: e.payload.change, origin: e.payload.origin }));
-    const usageEvents = this.store.listEvents(taskId).filter((e) => e.type === 'usage');
+    const usageEvents = resultEvents.filter((e) => e.type === 'usage');
     return {
       ok: true,
       result: {
@@ -1186,12 +1567,26 @@ export class TaskService {
       const ev = this.store.appendEvent(id, 'session', { status: 'resuming', reason: '应用重启，等待用户继续以恢复原生会话' });
       this.broadcast(ev);
     }
+    // 显式失效所有未决授权：回调已随进程消失，不能继续显示为可批准。
+    // 分两类：原状态为 running/waiting_permission 的 → 已标记 resuming；
+    // 其余（异常残留）→ 也逐条写失效事件，事件流保持"每条请求都有归宿"。
+    const unresolved = this.store.unresolvedPermissionRequests();
+    for (const [sessionId, requests] of unresolved) {
+      for (const req of requests) {
+        const ev = this.store.appendEvent(sessionId, 'permission_resolved', {
+          permissionId: req.permissionId, decision: 'invalidated',
+          reason: '应用重启，执行器回调已消失；该请求需要恢复任务后重新发起',
+        });
+        this.broadcast(ev);
+      }
+    }
     return ids;
   }
 
   shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.shuttingDown = true;
+    for (const controllers of this.isolatedCheckControllers.values()) for (const controller of controllers) controller.abort();
     this.waiter.close();
     const closing: Promise<unknown>[] = [];
     for (const [id, rt] of this.runtimes) {
@@ -1202,22 +1597,20 @@ export class TaskService {
       this.clearTimer(id);          // 关键：清掉执行超时定时器，否则测试进程/应用退出被最长 taskTimeoutSec 的定时器拖住
     }
     this.runtimes.clear();
-    // 拒绝所有未决授权，避免悬空 Promise
-    for (const [pid, p] of this.pendingPermissions) {
+    // 拒绝所有未决授权，避免悬空 Promise（状态不再刷新：服务正在关停）
+    for (const p of [...this.pendingPermissions.values()]) {
       try { p.resolve({ behavior: 'deny', message: '服务已关闭' }); } catch { /* ignore */ }
-      this.pendingPermissions.delete(pid);
     }
+    this.pendingPermissions.clear();
+    this.pendingByCall.clear();
+    this.pendingByContent.clear();
+    this.resolvedCalls.clear();
     this.shutdownPromise = Promise.allSettled(closing).then(() => {});
     return this.shutdownPromise;
   }
 
   // 泄漏测试：检索本地库（仅测试哨兵用）
   leakScan(needle: string) { return this.store.countOccurrences(needle); }
-}
-
-function isInsideDir(root: string, target: string): boolean {
-  const rel = path.relative(canonicalPath(root), canonicalPath(target));
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
 function sha1(s: string): string {

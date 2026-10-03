@@ -1,10 +1,20 @@
 import {useEffect,useState} from 'react';
-import {noticeLabel} from './board-model';
-export interface TaskNotice {id:string;taskId:string;label:string;time:string}
+export type {TaskNotice} from '../shared/task-notices';
+import type {TaskNotice} from '../shared/task-notices';
 const key='workbench.task-notices.v1';
 export function useTaskNotices(){
- const [notices,setNotices]=useState<TaskNotice[]>(()=>{try{const v=JSON.parse(localStorage.getItem(key)||'[]');return Array.isArray(v)?v.filter(x=>typeof x?.id==='string'&&typeof x?.taskId==='string'&&typeof x?.label==='string').slice(0,50):[];}catch{return [];}});
- useEffect(()=>{try{localStorage.setItem(key,JSON.stringify(notices));}catch{}},[notices]);
- useEffect(()=> (window as any).wb.onEvent((e:any)=>{const label=noticeLabel(e);if(!label)return;const id=`${e.sessionId}:${e.seq}`;setNotices(prev=>prev.some(n=>n.id===id)?prev:[{id,taskId:e.sessionId,label,time:e.createdAt},...prev].slice(0,50));}),[]);
- return {notices,ack:(taskId:string)=>setNotices(ns=>ns.filter(n=>n.taskId!==taskId))};
+ const [notices,setNotices]=useState<TaskNotice[]>([]);
+ useEffect(()=>{
+  let alive=true;
+  const refresh=async()=>{const r=await (window as any).wb.invoke('notices.list');if(alive&&r.ok)setNotices(r.data);};
+  const off=(window as any).wb.onEvent((e:any)=>{if(['result','error','permission_request'].includes(e.type))void refresh();});
+  void (async()=>{
+   let old=[];try{old=JSON.parse(localStorage.getItem(key)||'[]');}catch{}
+   const r=await (window as any).wb.invoke('notices.import',{notices:old});
+   if(r.ok){localStorage.removeItem(key);if(alive)setNotices(r.data);}
+   await refresh();
+  })();
+  return()=>{alive=false;off();};
+ },[]);
+ return {notices,ack:(taskId:string)=>{void (window as any).wb.invoke('notices.ack',{taskId}).then((r:any)=>{if(r.ok)setNotices(r.data);});}};
 }
