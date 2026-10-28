@@ -609,12 +609,16 @@ function ConvItemView({ item, onOpenFile, openFileRead }: { item: ConvItem; onOp
             <span>🔐 授权请求</span>
             <span className="tool-name">{item.ev.payload.toolName}</span>
             <span className="tool-state">{pending ? '等待你的决定'
-              : invalidated ? '已失效（需恢复任务后重试）'
+              : invalidated ? '已失效（发送新消息后重新请求）'
               : decision === 'allow' ? '已允许' : '已拒绝'}</span>
           </div>
           {reason && <div className="notice" style={{ margin: '0 12px' }}>为何需要授权：{reason}</div>}
+          {pending && item.ev.payload.expiresAt && <div className="notice" style={{ margin: '0 12px' }}>
+            有效至 {new Date(item.ev.payload.expiresAt).toLocaleTimeString()}。过期后任务停止，发送新消息可继续。
+          </div>}
+          {invalidated && item.resolved?.payload.reason && <div className="notice" style={{ margin: '0 12px' }}>{item.resolved.payload.reason}</div>}
           <div className="card-body"><div className="tool-input">{JSON.stringify(item.ev.payload.input, null, 2)}</div></div>
-          {pending && <PermActions permissionId={item.ev.payload.permissionId} />}
+          {pending && <PermActions taskId={item.ev.sessionId} permissionId={item.ev.payload.permissionId} />}
         </div>
       );
     }
@@ -665,23 +669,25 @@ function ConvItemView({ item, onOpenFile, openFileRead }: { item: ConvItem; onOp
   }
 }
 
-function PermActions({ permissionId }: { permissionId: string }) {
+function PermActions({ taskId, permissionId }: { taskId: string; permissionId: string }) {
   const [done, setDone] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const act = async (decision: 'allow' | 'deny') => {
+  const act = async (decision: 'allow' | 'deny', event: React.MouseEvent) => {
     setBusy(true);
     setError(null);
-    const r = await api('permissions.respond', { permissionId, decision });
+    const r = await api('permissions.respond', { taskId, permissionId, decision,
+      interaction: { type: event.type, trusted: event.isTrusted } });
     setBusy(false);
+    const result = unwrapSendResult(r);
     // 服务端结果权威：已处理/不存在时明确提示并保持可重试，不把按钮永久锁死
-    if (r?.ok) setDone(decision);
-    else setError(String(r?.error ?? '授权请求已处理或不存在，请刷新查看最新状态'));
+    if (result?.ok) setDone(decision);
+    else setError(String(result?.error ?? '授权请求已处理或不存在，请刷新查看最新状态'));
   };
   return (
     <div className="perm-actions">
-      <button className="btn primary" disabled={!!done || busy} onClick={() => act('allow')}>允许</button>
-      <button className="btn danger" disabled={!!done || busy} onClick={() => act('deny')}>拒绝</button>
+      <button className="btn primary" disabled={!!done || busy} onClick={(event) => act('allow', event)}>允许</button>
+      <button className="btn danger" disabled={!!done || busy} onClick={(event) => act('deny', event)}>拒绝</button>
       {done && <span style={{ fontSize: 11, color: 'var(--text-faint)', alignSelf: 'center' }}>已{done === 'allow' ? '允许' : '拒绝'}</span>}
       {error && <span style={{ fontSize: 11, color: 'var(--danger, #e07070)', alignSelf: 'center' }}>{error}</span>}
     </div>
@@ -964,13 +970,13 @@ function ModelManagerModal({ info, onClose, stateKey='models' }: { info: AppInfo
       {draft && <div className="model-manager-form">
         <h3>{draft.id ? '编辑模型' : '添加模型'}</h3>
         <label>名称</label>
-        <input type="text" value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} placeholder="例如 GLM 5.3 Flash" />
+        <input type="text" value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} placeholder="例如 项目模型" />
         <label>凭据来源</label>
         <select value={draft.providerId} onChange={(e) => selectSource(e.target.value)}>
           {(catalog?.sources ?? []).map((item) => <option key={item.providerId} value={item.providerId}>{item.name}（{item.providerId === 'grok-super-oauth' || item.providerId.startsWith('grok-config:') ? 'Grok' : item.providerId.startsWith('workbench-local:') ? 'Workbench' : item.providerId.startsWith('native:') ? '本机' : 'CC Switch'}）</option>)}
         </select>
         <label>模型 ID</label>
-        <input type="text" value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} placeholder="例如 glm-5.3-flash" />
+        <input type="text" value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} placeholder="例如 model-id" />
         <label>可用 Agent</label>
         <div className="model-agent-choices">{MODEL_AGENT_IDS.map((id) => {
           const disabled = id === 'grok' ? !canUseGrok : draft.providerId === 'grok-super-oauth' || draft.providerId.startsWith('grok-config:');
@@ -1164,7 +1170,6 @@ function FactsModal({ projectId: initialProjectId, taskId: initialTaskId, onClos
   const [taskId]=useWindowState('facts.taskId',initialTaskId);
   const keepRestoredBackground=useRef(hasRestoredState(`facts:${projectId}.facts`));
   const [facts,setFacts] = useWindowState(`facts:${projectId}.facts`,'');
-  const [nightly,setNightly] = useState<{lastCompletedAt:string|null;processedTurns:number;newDrafts:number;error:string|null}|null>(null);
   const [version,setVersion] = useWindowState<number|null>(`facts:${projectId}.version`,null,(v)=>v===null||typeof v==='number'&&Number.isFinite(v));
   const [entries,setEntries] = useState<MemoryEntry[]>([]);
   const [matches,setMatches] = useState<MemoryEntry[]>([]);
@@ -1182,12 +1187,11 @@ function FactsModal({ projectId: initialProjectId, taskId: initialTaskId, onClos
   const [notice,setNotice] = useState('');
   const [busy,setBusy] = useState(false);
   const reload = useCallback(async () => {
-    const [memory,items,night] = await Promise.all([api('project.memory.get',{projectId}),api('project.memory.entries.list',{projectId}),api('memory.nightly.status')]);
+    const [memory,items] = await Promise.all([api('project.memory.get',{projectId}),api('project.memory.entries.list',{projectId})]);
     if (memory.ok) { if(!keepRestoredBackground.current){setFacts(memory.data.facts);setVersion(memory.data.version);} keepRestoredBackground.current=false; }
     else setError(memory.error);
     if (items.ok) { setEntries(items.data);setMatches(items.data);setMatchedBy({}); }
     else setError(items.error);
-    if (night.ok) setNightly(night.data);
   },[projectId]);
   useEffect(()=>{ void reload(); },[reload]);
   const clearEditor = () => { setSelected(null);setKind('lesson');setTitle('');setBody('');setSource('');setTaskLink(taskId ?? '');setExpiresAt('');setEvidence('');setError('');setNotice(''); };
@@ -1257,9 +1261,7 @@ function FactsModal({ projectId: initialProjectId, taskId: initialTaskId, onClos
   return <div className="modal-mask" onClick={onClose}>
     <div className="modal model-manager" style={{ width:760,maxWidth:'94vw' }} onClick={(e)=>e.stopPropagation()}>
       <h3>项目背景与经验</h3>
-      <div className="hint">夜间整理（全部项目）：{nightly?.lastCompletedAt
-        ? `${new Date(nightly.lastCompletedAt).toLocaleString()} 完成，处理 ${nightly.processedTurns} 个任务结果，新增 ${nightly.newDrafts} 条待核对草稿`
-        : '尚未完成首次整理'}{nightly?.error ? `；上次失败：${nightly.error}` : ''}</div>
+
       {error&&<p role="alert" style={{color:'var(--danger)'}}>{error}</p>}{notice&&<p role="status" style={{color:'var(--accent)'}}>{notice}</p>}
       <section style={{ borderBottom:'1px solid var(--border)',paddingBottom:12,marginBottom:12 }}>
         <h4>已确认背景 · 版本 {version ?? '加载中'}</h4>

@@ -48,6 +48,7 @@ async function until(check, label) {
 let electron, duplicate;
 try {
   electron = await _electron.launch({ executablePath, args, env, timeout: 30000 });
+  console.log(JSON.stringify({ pid: electron.process().pid, startedAt: new Date().toISOString(), executablePath, args, dataDir, purpose: 'isolated desktop regression' }));
   let page;
   const currentPage = async () => {
     await until(() => !!electron.windows().find(candidate => !candidate.isClosed()), 'new renderer page');
@@ -117,7 +118,7 @@ try {
     await show();
     assert.notEqual((await identity()).windowId, old.windowId);
   };
-  assert.equal(typeof (await rpc('memory.nightly.status')).status?.processedTurns, 'number');
+  assert.equal((await rpc('memory.nightly.status')).status, null, 'public build does not start a fixed-model background extractor');
   const pollingCount = () => (fs.readFileSync(path.join(dataDir, 'main.log'), 'utf8').match(/\[ipc\] tasks\.progress 完成/g) || []).length;
   assert.equal((await state()).trayReady, true);
   await until(async () => (await state()).windowVisible, 'initial window');
@@ -278,11 +279,11 @@ try {
   assert.equal(finalNotices.data.some(notice => notice.taskId === fixtureTaskId), false, 'acknowledged notices do not return after renderer reconstruction');
   await page.getByRole('button', { name: '模型配置', exact: true }).click();
   await page.getByRole('button', { name: '＋ 添加模型', exact: true }).click();
-  await page.getByPlaceholder('例如 GLM 5.3 Flash').fill('unsaved model profile');
-  await page.getByPlaceholder('例如 glm-5.3-flash').fill('desktop-model-fixture');
+  await page.getByPlaceholder('例如 项目模型').fill('unsaved model profile');
+  await page.getByPlaceholder('例如 model-id').fill('desktop-model-fixture');
   await reconstruct('model profile draft releases and reconstructs');
-  assert.equal(await page.getByPlaceholder('例如 GLM 5.3 Flash').inputValue(), 'unsaved model profile');
-  assert.equal(await page.getByPlaceholder('例如 glm-5.3-flash').inputValue(), 'desktop-model-fixture');
+  assert.equal(await page.getByPlaceholder('例如 项目模型').inputValue(), 'unsaved model profile');
+  assert.equal(await page.getByPlaceholder('例如 model-id').inputValue(), 'desktop-model-fixture');
   // Local credential metadata survives renderer destruction, but an unsaved key
   // must never be included in the checkpoint written to the isolated database.
   const unsavedKey = 'fake-unsaved-desktop-key-fixture';

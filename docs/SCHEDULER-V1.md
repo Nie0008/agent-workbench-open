@@ -22,7 +22,7 @@ Workbench 管理 Claude Code、Grok、DSH 和 ZCode 任务。主控可通过 MCP
 
 接口返回 `reason`、`events`、`cursors` 和 `serverTime`。下一次将 `cursors` 原样作为 `targets`；原因包括 `events`、`timeout`、`aborted` 和 `shutdown`。等待超时后可以继续等待；取消等待不会取消执行任务。
 
-授权事件只是通知摘要。先用 `workbench_list_permissions` 核对完整操作，再根据已有用户授权调用 `workbench_respond_permission`。等待授权时暂停无进展超时计时，不能通过扩大权限跳过待处理的操作。
+授权事件只是通知摘要。先用 `workbench_list_permissions` 核对完整操作，再根据已有用户授权调用 `workbench_respond_permission`。等待授权时暂停无进展超时计时，但每项授权最多等待 15 分钟；任一请求过期即停止任务并作废全部待授权。继续时向原任务发送新消息，不能重试旧批准或通过扩大权限跳过待处理的操作。
 
 ## 项目背景与经验
 

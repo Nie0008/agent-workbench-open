@@ -137,7 +137,7 @@ test('内置 Agent 工具只能访问自己的子任务，未知同名前缀不�
   const root = path.join(tmp, 'agent-tool-boundary');
   fs.mkdirSync(root);
   const project = ts.createProject(root);
-  const base = { projectId: project.id, agentId: 'claude-code', model: 'glm-5.3-flash', cwd: root, scope: { fileWrite: false } };
+  const base = { projectId: project.id, agentId: 'claude-code', model: 'fixture-model', cwd: root, scope: { fileWrite: false } };
   store.createSession({ ...base, id: 'parent-a', kind: 'main', title: '主任务 A' });
   store.createSession({ ...base, id: 'parent-b', kind: 'main', title: '主任务 B' });
   store.createSession({ ...base, id: 'child-a', kind: 'sub', parentSessionId: 'parent-a', title: 'A 的子任务' });

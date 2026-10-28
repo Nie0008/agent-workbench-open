@@ -69,6 +69,7 @@ fs.copyFileSync(path.join(root, 'src/renderer/index.html'), path.join(root, 'dis
 fs.copyFileSync(path.join(root, 'src/renderer/styles.css'), path.join(root, 'dist/renderer/styles.css'));
 
 if (testMode) {
+  fs.rmSync(path.join(root, 'dist-test'), { recursive: true, force: true });
   const testFiles = fs.readdirSync(path.join(root, 'tests')).filter((f) => f.endsWith('.test.ts'));
   await esbuild.build({
     ...common,

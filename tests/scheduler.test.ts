@@ -7,7 +7,7 @@ import {Store} from '../src/main/store';
 import {TaskService} from '../src/main/taskService';
 import {CredentialManager} from '../src/main/credentials';
 import {ControlServer} from '../src/main/controlServer';
-import {ClaudeCodeSession} from '../src/main/adapters/claude';
+import {ClaudeCodeSession,skillSessionEnv} from '../src/main/adapters/claude';
 import http from 'node:http';
 function fixture(){
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'wb-scheduler-'));
@@ -204,7 +204,7 @@ test('idle release retires the handle; the same task resumes with its persisted 
 test('parent release is deferred while a registered child is active',async()=>{
  const f=fixture();try{
   const parent=f.task(),childId='child-active';
-  f.store.createSession({id:childId,projectId:f.project.id,kind:'sub',parentSessionId:parent.id,title:'child',agentId:'mock',model:'glm-5.3-flash',cwd:f.dir,scope:{fileWrite:false},providerId:null,delegation:null});
+  f.store.createSession({id:childId,projectId:f.project.id,kind:'sub',parentSessionId:parent.id,title:'child',agentId:'mock',model:'fixture-model',cwd:f.dir,scope:{fileWrite:false},providerId:null,delegation:null});
   f.store.updateSession(childId,{status:'running'});
   let closed=0;const rt:any={handle:{close:async()=>{closed++;}},timer:null,ended:false};
   (f.service as any).runtimes.set(parent.id,rt);
@@ -286,9 +286,10 @@ test('shutdown waits for every adapter and an in-flight close, without closing t
 });
 
 test('repeated Claude resume failures retain the native id and never become a fresh session',async()=>{
+ const f=fixture();
  const resumes:Array<string|undefined>=[],ends:string[]=[];let ended!:()=>void;
  const waitForEnd=()=>new Promise<void>(resolve=>{ended=resolve;});let endGate=waitForEnd();
- const session=new ClaudeCodeSession({cwd:'/tmp',model:'test',env:{},resumeNativeSessionId:'native-stable-id',
+ const session=new ClaudeCodeSession({cwd:'/tmp',model:'test',env:{WORKBENCH_DATA_DIR:f.dir,CLAUDE_CONFIG_DIR:path.join(f.dir,'user')},resumeNativeSessionId:'native-stable-id',
   onEvent:()=>{},onEnd:(reason)=>{ends.push(reason);ended();}},async()=>({query:((options:any)=>{
    resumes.push(options.options.resume);
    return {close(){},interrupt:async()=>{},async *[Symbol.asyncIterator](){throw new Error('resume rejected');}} as any;
@@ -297,13 +298,17 @@ test('repeated Claude resume failures retain the native id and never become a fr
  endGate=waitForEnd();await session.send('retry same task');await endGate;
  assert.deepEqual(resumes,['native-stable-id','native-stable-id']);
  assert.deepEqual(ends,['error','error']);
- await session.close();
+ await session.close();f.close();
 });
 
 test('Claude start and native resume preserve ask-all settings and permission callback IDs',async()=>{
+ const f=fixture(),source=path.join(f.dir,'user');
+ for(const name of ['skills','projects'])fs.mkdirSync(path.join(source,name),{recursive:true});
+ fs.writeFileSync(path.join(source,'settings.json'),JSON.stringify({env:{ANTHROPIC_MODEL:'wrong'},hooks:{SessionStart:[{hooks:[{type:'command',command:'not-authorized'}]}]}}));
+ fs.writeFileSync(path.join(source,'projects','native-policy-id.jsonl'),'existing native session');
  const options:any[]=[],calls:any[]=[];let ended!:()=>void;
  const waitForEnd=()=>new Promise<void>(resolve=>{ended=resolve;});let endGate=waitForEnd();
- const session=new ClaudeCodeSession({cwd:'/tmp',model:'test',env:{},
+ const session=new ClaudeCodeSession({cwd:'/tmp',model:'second-model',reasoningLevel:'max',env:{WORKBENCH_DATA_DIR:f.dir,CLAUDE_CONFIG_DIR:source,ANTHROPIC_MODEL:'bound-model',CLAUDE_CODE_EFFORT_LEVEL:'low'},
   canUseTool:async(name,input,ctx)=>{calls.push({name,input,ctx});return {behavior:'deny'};},
   onEvent:()=>{},onEnd:()=>{ended();}},async()=>({query:((request:any)=>{
    options.push(request.options);const round=options.length;
@@ -322,12 +327,32 @@ test('Claude start and native resume preserve ask-all settings and permission ca
   for(const option of options){
    assert.deepEqual(option.settings,{permissions:{ask:['*']}});
    assert.equal(option.permissionMode,'default');
-   assert.deepEqual(option.settingSources,[]);
+   assert.deepEqual(option.settingSources,['user']);
+   assert.equal(option.env.ANTHROPIC_MODEL,'bound-model');
+   assert.equal(option.env.CLAUDE_CODE_EFFORT_LEVEL,'max');
+   assert.equal(fs.realpathSync(path.join(option.env.CLAUDE_CONFIG_DIR,'skills')),fs.realpathSync(path.join(source,'skills')));
+   assert.equal(fs.readFileSync(path.join(option.env.CLAUDE_CONFIG_DIR,'projects','native-policy-id.jsonl'),'utf8'),'existing native session');
+   assert.equal(fs.existsSync(path.join(option.env.CLAUDE_CONFIG_DIR,'settings.json')),false);
    assert.equal(option.allowDangerouslySkipPermissions,undefined);
   }
   assert.equal(options[0].resume,undefined);assert.equal(options[1].resume,'native-policy-id');
+  assert.equal(options[0].env.CLAUDE_CONFIG_DIR,options[1].env.CLAUDE_CONFIG_DIR);
+  assert.equal(fs.readFileSync(path.join(source,'settings.json'),'utf8').includes('not-authorized'),true);
   assert.deepEqual(calls.map(c=>c.ctx),[{toolUseId:'call-1',requestId:'request-1'},{toolUseId:'call-2',requestId:'request-2'}]);
- }finally{await session.close();}
+ }finally{await session.close();f.close();}
+});
+
+test('Claude Skill mount refuses existing paths and keeps different config roots separate',()=>{
+ const f=fixture();try{
+  const env={WORKBENCH_DATA_DIR:f.dir,CLAUDE_CONFIG_DIR:path.join(f.dir,'user-a')};
+  const first=skillSessionEnv(env),second=skillSessionEnv({...env,CLAUDE_CONFIG_DIR:path.join(f.dir,'user-b')});
+  assert.notEqual(first.CLAUDE_CONFIG_DIR,second.CLAUDE_CONFIG_DIR);
+  const target=path.join(first.CLAUDE_CONFIG_DIR,'skills');
+  fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(path.join(target,'keep.txt'),'keep');
+  assert.throws(()=>skillSessionEnv(env),/未覆盖现有路径/);
+  assert.equal(fs.readFileSync(path.join(target,'keep.txt'),'utf8'),'keep');
+  assert.equal(env.CLAUDE_CONFIG_DIR,path.join(f.dir,'user-a'));
+ }finally{f.close();}
 });
 
 test('Claude SDK error results retain the failure reason without credential values',()=>{

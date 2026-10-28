@@ -418,7 +418,8 @@ test('policyCheck：Bash 按任务范围联动，网络与未知工具逐条请�
 
 test('真实 Docker 隔离检查：构建和测试自动执行、结果持久化、越界命令待授权',
   { skip: process.platform === 'win32' || process.env.WORKBENCH_TEST_DOCKER !== '1' }, async () => {
-    const image = 'sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31';
+    const image = process.env.WORKBENCH_TEST_DOCKER_IMAGE ?? '';
+    assert.match(image, /^sha256:[0-9a-f]{64}$/, '请通过 WORKBENCH_TEST_DOCKER_IMAGE 指定本机测试镜像的完整 ID');
     const commands = ['python -m compileall -q .', 'python -m unittest discover -v',
       'python -c "import os,socket; print(os.getenv(\'ANTHROPIC_AUTH_TOKEN\',\'HIDDEN\'), os.path.exists(\'.env\'), socket.socket().connect_ex((\'1.1.1.1\',80)))"'];
     fs.writeFileSync(path.join(f.project.rootPath, 'calc.py'), 'def add(a, b): return a + b\n');

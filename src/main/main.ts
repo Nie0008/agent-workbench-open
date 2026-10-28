@@ -1,5 +1,5 @@
 // Electron 主进程入口：窗口、服务装配、控制通道、启动恢复
-import { app, BrowserWindow, Notification, powerMonitor, safeStorage } from 'electron';
+import { app, BrowserWindow, Notification, safeStorage } from 'electron';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +10,6 @@ import { ControlServer } from './controlServer';
 import { registerIpc } from './ipc';
 import { createWorkbenchMcpServer } from './mcp/agentTools';
 import { DesktopShell } from './desktopShell';
-import { NightlyMemoryService } from './nightlyMemory';
 import { workbenchDataDir } from './paths';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -18,7 +17,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let desktop: DesktopShell | null = null;
 let taskService: TaskService;
 let control: ControlServer;
-let nightly: NightlyMemoryService | null = null;
 let quitting = false;
 let shutdownComplete = false;
 
@@ -104,8 +102,7 @@ if (!gotLock) {
       const store = process.env.WORKBENCH_SKIP_STORE === '1' ? null : new Store(path.join(dataDir, 'workbench.db'));
       const credentials = new CredentialManager(undefined, { store: store ?? undefined, vault: safeStorage });
       taskService = new TaskService(store as any, credentials);
-      if (store) nightly = new NightlyMemoryService(taskService);
-      control = new ControlServer(taskService, nightly);
+      control = new ControlServer(taskService);
       await control.start(path.join(dataDir, 'control.json'));
       log(`[main] 控制通道就绪 port=${(control as any).port ?? '?'}`);
 
@@ -135,7 +132,7 @@ if (!gotLock) {
     // 通知点击同款深度链接入口（control 验证/外部通知代理共用；不改变权限状态）
     control.openTaskFn = (taskId: string) => { try { desktop?.openTask(taskId); } catch { /* 未开窗口时忽略 */ } };
     registerIpc(taskService, () => desktop?.getWindow() ?? null, dataDir,
-      () => desktop?.hide() ?? false, nightly);
+      () => desktop?.hide() ?? false);
 
     // 待授权的用户通知与处理入口：
     //  - 每条"新逻辑待授权"发一次系统通知（协议重试在 TaskService 内去重，不会重复提醒）；
@@ -191,8 +188,6 @@ if (!gotLock) {
       });
       await desktop.start(process.env.WORKBENCH_START_HIDDEN === '1');
     }
-    nightly?.start();
-    powerMonitor.on('resume', () => nightly?.onResume());
     app.on('activate', () => { void desktop?.show().catch((error) => log(`[win] ${String(error)}`)); });
 
     if (resuming.length) log(`[main] ${resuming.length} 个进行中任务标记为 恢复中`);
@@ -224,7 +219,7 @@ if (!gotLock) {
       shutdownComplete = true;
       app.quit();
     }, 8_000);
-    Promise.resolve(nightly?.stop()).catch(() => {}).then(() => taskService?.shutdown()).finally(() => {
+    Promise.resolve().then(() => taskService?.shutdown()).finally(() => {
       clearTimeout(timeout);
       if (shutdownComplete) return;
       taskService?.store?.close();

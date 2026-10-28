@@ -99,8 +99,8 @@ test('CC Switch configuration is copied into Workbench without exposing the key 
   cc.exec('CREATE TABLE providers(id TEXT PRIMARY KEY,app_type TEXT,name TEXT,settings_config TEXT,is_current INTEGER,sort_index INTEGER)');
   const write = (key: string) => cc.prepare('INSERT INTO providers VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET settings_config=excluded.settings_config')
     .run('cc-one', 'claude', 'Fixture CC', JSON.stringify({ env: {
-      ANTHROPIC_BASE_URL:'https://open.bigmodel.cn/api/anthropic', ANTHROPIC_MODEL:'glm-5.3-flash',
-      ANTHROPIC_AUTH_TOKEN:key, ANTHROPIC_DEFAULT_OPUS_MODEL:'glm-5.3-flash', API_TIMEOUT_MS:'600000',
+      ANTHROPIC_BASE_URL:'https://open.bigmodel.cn/api/anthropic', ANTHROPIC_MODEL:'fixture-model',
+      ANTHROPIC_AUTH_TOKEN:key, ANTHROPIC_DEFAULT_OPUS_MODEL:'fixture-model', API_TIMEOUT_MS:'600000',
     } }), 1, 0);
   write('IMPORT_FIXTURE_SECRET');
   const store = new Store(path.join(root, 'workbench.db'));
@@ -119,6 +119,7 @@ test('CC Switch configuration is copied into Workbench without exposing the key 
     const imported = service.importCcSwitchCredential('cc-one');
     assert.ok(!JSON.stringify(imported).includes('IMPORT_FIXTURE_SECRET'));
     assert.equal(imported.profilesCopied, 2);
+    assert.ok(service.modelCatalog.list().every(profile => profile.reasoningLevel === undefined), '导入不设置维护者的思考级别偏好');
     assert.equal(imported.defaultChanged, true);
     assert.equal(imported.existingTasksStillBound, 1);
     assert.equal(store.getKV('defaultProviderId'), imported.source.providerId);
@@ -129,7 +130,7 @@ test('CC Switch configuration is copied into Workbench without exposing the key 
     assert.equal(newTask.model, 'other-model');
     const env = (service as any).buildEnv(newTask);
     assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'IMPORT_FIXTURE_SECRET');
-    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'glm-5.3-flash');
+    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'fixture-model');
     assert.equal(env.API_TIMEOUT_MS, '600000');
     assert.equal(store.countOccurrences('IMPORT_FIXTURE_SECRET'), 0);
     write('ROTATED_IMPORT_SECRET');

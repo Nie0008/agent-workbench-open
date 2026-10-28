@@ -83,6 +83,10 @@ args = ["/absolute/path/to/Agent Workbench.app/Contents/Resources/app/dist/main/
 
 派发方需要持续跟进时，可由已获委派授权的子代理使用 `workbench_wait_task_events` 接收关键事件；普通输出和 20 秒等待超时不代表失败。收到授权事件后，先用 `workbench_list_permissions` 核对完整操作，再按已有用户授权逐项响应，随后等待真实结果。跟进代理只处理交接的 taskId，结束时回报产物、错误及剩余待办。该方式依赖当前 Agent 会话继续运行，不能承诺跨会话常驻或唤醒已结束对话。
 
+待授权结果中的 `expiresAt` 是失效时间。每项请求有效期为 15 分钟，任一请求过期即停止任务并作废其全部待授权；电脑休眠导致计时器延迟时，响应入口仍会拒绝过期请求。继续时向原 `taskId` 发送新消息，旧 `permissionId` 不能恢复任务。
+
+授权响应必须携带匹配的 `taskId`。处理结果的 `permission_resolved` 事件包含 `audit`，记录请求时间、失效时间、输入指纹和调用来源。能关联到任务的过期、跨任务或重复响应会记录为 `permission_response_rejected`。客户端名称和点击信息属于上报信息，`actorIdentity=unverified` 表示没有核验真人身份；来源记录不等于新增授权。
+
 ## 模型选择
 
 Workbench 的「模型配置」集中保存模型 ID、凭据来源和可用 Agent。多个模型可引用同一 CC Switch 供应商；Grok Build 还可使用本机 Grok Super 登录或 Grok 配置。新建任务窗口可将组合保存为对应 Agent 的默认模型；此后仅传 `agentId` 即使用该默认。一次性指定 `providerId/model` 不改默认。同一任务续接使用原绑定；切换模型需新建任务。来源或端点不匹配时不会自动改派。实际可用组合以 `workbench_list_agent_options` 的当前返回为准。

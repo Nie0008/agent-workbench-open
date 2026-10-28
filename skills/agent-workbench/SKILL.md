@@ -25,7 +25,7 @@ description: 通过本机 Agent Workbench 派发、继续和跟进外部执行�
 - `network` 默认 false；明确授权网络工具时才传 true。
 - `isolatedChecks` 只给支持它的执行器，包含已在本机的完整镜像 `sha256:` ID 与逐条明确授权的精确命令。它不授予宿主 Bash 权限。
 
-收到授权事件，调用 `workbench_list_permissions` 的 `{taskId}` 读取完整输入和越界原因。对已覆盖的操作，逐项用 `workbench_respond_permission` 的 `{taskId,permissionId,decision:"allow"|"deny"}` 响应；无法可靠确认授权时把真实操作交给用户决定。仅处理本次交接的 taskId；不能依靠模型置信度、工具名、只读标签或全局自动批准代替授权核对。
+收到授权事件，调用 `workbench_list_permissions` 的 `{taskId}` 读取完整输入和越界原因。对已覆盖的操作，逐项用 `workbench_respond_permission` 的 `{taskId,permissionId,decision:"allow"|"deny"}` 响应；无法可靠确认授权时把真实操作交给用户决定。每项请求有效期为 15 分钟；失效后读取任务状态，需要继续时向原任务发送新消息，不重试旧批准。仅处理本次交接的 taskId；不能依靠模型置信度、工具名、只读标签或全局自动批准代替授权核对。
 
 ## 跟进和验收
 

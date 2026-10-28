@@ -34,6 +34,19 @@ export interface Settings {
 
 const DEFAULT_SETTINGS: Settings = { taskTimeoutSec: 900, maxConcurrentSubtasks: 2, maxDelegationsPerTask: 20 };
 
+// 授权等待不占执行超时，但也不能让旧执行器无限期等待一次点击。
+export const PERMISSION_WAIT_MS = 15 * 60 * 1000;
+
+export interface PermissionResponseOrigin {
+  transport: 'electron-ipc' | 'control-http' | 'internal';
+  requestId: string;
+  entryPoint?: string;
+  remoteAddress?: string;
+  caller?: Record<string, string | number>; // 客户端自报信息，不作为身份认证
+  window?: { id: number; processId: number; frameUrl: string; focused: boolean; visible: boolean };
+  interaction?: { type: string; trusted: boolean }; // 渲染端上报；不能区分真人与系统级自动操作
+}
+
 const WORKBENCH_TOOLS = [
   'delegate_task', 'list_subtasks', 'read_task_result', 'append_task_message', 'cancel_task', 'get_task_events', 'run_isolated_check',
 ] as const;
@@ -55,6 +68,8 @@ interface PendingPermission {
   reason: string;         // 为何超出自动放行范围（展示给用户）
   toolUseId: string | null;
   createdAt: string;
+  expiresAt: string;
+  timer?: NodeJS.Timeout;
   resolve: (r: { behavior: 'allow' | 'deny'; message?: string }) => void;
   thenable: Promise<{ behavior: 'allow' | 'deny'; message?: string }>;
   settled: boolean;
@@ -413,7 +428,7 @@ export class TaskService {
       providerId = input.providerId ?? providerId; // mock 会话记录绑定但不校验（测试用）
     }
     const model = input.model ?? (preferred?.model && providerId === preferred.providerId ? preferred.model : null)
-      ?? (isMock ? 'glm-5.3-flash'
+      ?? (isMock ? 'mock-model'
       : agentId === 'grok' && providerId === GROK_SUPER_PROVIDER_ID ? GROK_SUPER_MODEL
       : grokConfigProvider ? grokConfigProvider.model
       : this.providerModel(providerId));
@@ -635,8 +650,14 @@ export class TaskService {
 
   listPendingPermissions(taskId: string) {
     if (!this.store.getSession(taskId)) return { ok: false, error: '任务不存在' };
+    for (const p of this.pendingPermissions.values()) {
+      if (p.sessionId === taskId && Date.now() >= Date.parse(p.expiresAt)) {
+        this.expirePermissions(taskId);
+        break;
+      }
+    }
     return { ok: true, permissions: [...this.pendingPermissions].filter(([,p]) => p.sessionId === taskId)
-      .map(([permissionId,p]) => ({permissionId, taskId, toolName:p.toolName, input:p.input, reason:p.reason, toolUseId:p.toolUseId, createdAt:p.createdAt})) };
+      .map(([permissionId,p]) => ({permissionId, taskId, toolName:p.toolName, input:p.input, reason:p.reason, toolUseId:p.toolUseId, createdAt:p.createdAt, expiresAt:p.expiresAt})) };
   }
 
   async runIsolatedCheck(taskId: string, command: string, requestedImage?: string): Promise<{ ok: boolean; exitCode?: number; output?: string; cached?: boolean; error?: string }> {
@@ -743,17 +764,44 @@ export class TaskService {
   // 决定落盘先于返回执行器：appendEvent 提交后 resolve，保证"事件流里已有决定"时
   // 执行器才拿到放行。落盘失败（存储关闭/磁盘满）时不得丢失待办或悬挂执行器回调：
   // 保守按"拒绝"返回执行器并记录错误，记录先于 resolve。
-  respondPermission(permissionId: string, decision: 'allow' | 'deny', taskId?: string, source: 'ui' | 'control' | 'internal' = 'internal') {
+  respondPermission(permissionId: string, decision: 'allow' | 'deny', taskId?: string, source: 'ui' | 'control' | 'internal' = 'internal',
+      origin?: PermissionResponseOrigin) {
     if (decision !== 'allow' && decision !== 'deny') return { ok:false, error:'无效授权决定' };
     const p = this.pendingPermissions.get(permissionId);
-    if (!p) return { ok: false, error:'授权请求已处理或不存在' };
-    if (taskId && p.sessionId !== taskId) return { ok:false, error:'授权请求与任务不匹配' };
+    const session = this.store.getSession(p?.sessionId ?? taskId ?? '');
+    const audit = { responseId: crypto.randomUUID(), receivedAt: new Date().toISOString(),
+      backendProcessId: process.pid, actorIdentity: 'unverified',
+      origin: origin ?? { transport: 'internal', requestId: crypto.randomUUID() },
+      requestedTaskId: taskId ?? null, taskId: p?.sessionId ?? taskId ?? null,
+      projectId: session?.projectId ?? null, requestCreatedAt: p?.createdAt ?? null,
+      expiresAt: p?.expiresAt ?? null, toolUseId: p?.toolUseId ?? null, inputHash: p?.inputHash ?? null };
+    const reject = (error: string) => {
+      if (session) {
+        const ev = this.store.appendEvent(session.id, 'notice', {
+          kind: 'permission_response_rejected', text: error, permissionId, decision, source, audit,
+        });
+        this.broadcast(ev);
+      }
+      return { ok: false, error };
+    };
+    if (!p) return reject('授权请求已处理或不存在');
+    if (source !== 'internal' && (typeof taskId !== 'string' || !taskId)) return reject('授权响应必须指定任务');
+    if (taskId && p.sessionId !== taskId) return reject('授权请求与任务不匹配');
+    if (Date.now() >= Date.parse(p.expiresAt)) {
+      try { return reject('授权请求已过期，任务已停止；发送新消息才能继续'); }
+      finally { this.expirePermissions(p.sessionId); }
+    }
+    if (!session || !['running', 'waiting_permission'].includes(session.status)) {
+      const result = reject('任务不在执行中，旧授权不能恢复任务');
+      this.settlePendingPermissions(p.sessionId, result.error, 'invalidated', { refreshStatus: false });
+      return result;
+    }
     this.removePending(p);
-    const reason = decision === 'allow' ? undefined : '用户拒绝了该操作';
+    const reason = decision === 'allow' ? undefined : '该操作已被拒绝';
     let persisted = true;
     let ev: WorkbenchEvent | null = null;
     try {
-      ev = this.store.appendEvent(p.sessionId, 'permission_resolved', { permissionId, decision, reason, source });
+      ev = this.store.appendEvent(p.sessionId, 'permission_resolved', { permissionId, decision, reason, source, audit });
     } catch (e: any) {
       persisted = false;
       console.error(`[perm] 决定落盘失败（${e?.message ?? e}），按拒绝处理以防越权执行`);
@@ -789,6 +837,7 @@ export class TaskService {
   }
 
   private removePending(p: PendingPermission) {
+    if (p.timer) clearTimeout(p.timer);
     p.settled = true;
     this.pendingPermissions.delete(p.permissionId);
     if (p.callKey && this.pendingByCall.get(p.callKey) === p) this.pendingByCall.delete(p.callKey);
@@ -801,6 +850,12 @@ export class TaskService {
     catch { return null; } // 循环引用等无法序列化的输入不去重
   }
 
+  private expirePermissions(sessionId: string) {
+    const reason = '授权等待超时，旧请求已失效；发送新消息才能继续任务';
+    this.settlePendingPermissions(sessionId, reason, 'invalidated', { refreshStatus: false });
+    this.cancel(sessionId, { reason });
+  }
+
   // 把任务的全部待授权按给定决定结清（取消/执行器退出/关停/恢复共用）。
   // 结清的记录立即从映射中移除：旧 permissionId 不能再被放行。
   // refreshStatus=false 时不动状态（调用方随后自行写终态，避免中间态噪音）。
@@ -811,7 +866,7 @@ export class TaskService {
       this.removePending(p);
       if (decision === 'deny') this.rememberResolved(p, 'deny');
       try {
-        const ev = this.store.appendEvent(sessionId, 'permission_resolved', { permissionId: p.permissionId, decision, reason });
+        const ev = this.store.appendEvent(sessionId, 'permission_resolved', { permissionId: p.permissionId, decision, reason, source: 'internal' });
         this.broadcast(ev);
       } catch (e: any) {
         console.error(`[perm] 结清事件落盘失败（${e?.message ?? e}）；执行器回调按拒绝释放`);
@@ -881,12 +936,14 @@ export class TaskService {
     }
 
     const permissionId = crypto.randomUUID();
+    const createdAt = new Date();
     this.clearTimer(session.id);
     let resolve!: (r: { behavior: 'allow' | 'deny'; message?: string }) => void;
     const thenable = new Promise<{ behavior: 'allow' | 'deny'; message?: string }>((r) => { resolve = r; });
     const record: PendingPermission = {
       permissionId, sessionId: session.id, toolName, input, inputHash, callKey, reason, toolUseId,
-      createdAt: new Date().toISOString(), resolve, thenable, settled: false,
+      createdAt: createdAt.toISOString(), expiresAt: new Date(createdAt.getTime() + PERMISSION_WAIT_MS).toISOString(),
+      resolve, thenable, settled: false,
     };
     this.pendingPermissions.set(permissionId, record);
     if (callKey) this.pendingByCall.set(callKey, record);
@@ -898,7 +955,7 @@ export class TaskService {
     try {
       this.setStatus(session.id, 'waiting_permission');
       ev = this.store.appendEvent(session.id, 'permission_request', {
-        permissionId, toolName, input, reason, toolUseId, callKey,
+        permissionId, toolName, input, reason, toolUseId, callKey, expiresAt: record.expiresAt,
       });
     } catch (e: any) {
       this.removePending(record);
@@ -906,6 +963,10 @@ export class TaskService {
       try { this.refreshPermissionStatus(session.id); } catch { /* 存储仍不可用时等待恢复流程修正状态 */ }
       console.error(`[perm] 请求落盘失败（${e?.message ?? e}），已拒绝该操作`);
       return thenable;
+    }
+    if (!record.settled) {
+      record.timer = setTimeout(() => this.expirePermissions(session.id), Math.max(0, Date.parse(record.expiresAt) - Date.now()));
+      record.timer.unref();
     }
     try { this.broadcast(ev); } catch (e: any) {
       console.error(`[perm] 授权请求已落盘，但界面广播失败（${e?.message ?? e}）`);
@@ -1603,6 +1664,7 @@ export class TaskService {
     this.runtimes.clear();
     // 拒绝所有未决授权，避免悬空 Promise（状态不再刷新：服务正在关停）
     for (const p of [...this.pendingPermissions.values()]) {
+      if (p.timer) clearTimeout(p.timer);
       try { p.resolve({ behavior: 'deny', message: '服务已关闭' }); } catch { /* ignore */ }
     }
     this.pendingPermissions.clear();

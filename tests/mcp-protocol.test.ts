@@ -85,6 +85,29 @@ function notify(rpc: Rpc, method: string) {
 
 function wait(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
+test('MCP 批准记录真实入口进程、初始化客户端、工具名和 JSON-RPC 调用编号', async () => {
+  ts.registerMockScript('permission-audit', { id: 'permission-audit', steps: [] });
+  const project = ts.createProject(path.join(tmp, 'permission-audit-project'));
+  const task = ts.createMainSession({ projectId: project.id, title: 'audit', agentId: 'mock', mockScript: 'permission-audit' });
+  const pendingResult = (ts as any).requestPermission(task, 'Bash', { command: 'echo test' });
+  const permission = ts.listPendingPermissions(task.id).permissions![0];
+  const rpc = spawnEntry(); childProc = rpc.proc;
+  await send(rpc, 'initialize', { clientInfo: { name: 'approval-audit-test', version: '2' } });
+  const response = await send(rpc, 'tools/call', { name: 'workbench_respond_permission',
+    arguments: { taskId: task.id, permissionId: permission.permissionId, decision: 'allow' } });
+  assert.equal(JSON.parse(response.result.content[0].text).ok, true);
+  assert.equal((await pendingResult).behavior, 'allow');
+  const audit = store.listEvents(task.id).find(e => e.type === 'permission_resolved')!.payload.audit;
+  assert.equal(audit.origin.transport, 'control-http');
+  assert.equal(audit.origin.caller.name, 'approval-audit-test');
+  assert.equal(audit.origin.caller.version, '2');
+  assert.equal(audit.origin.caller.pid, rpc.proc.pid);
+  assert.equal(audit.origin.caller.parentPid, process.pid);
+  assert.equal(audit.origin.caller.tool, 'workbench_respond_permission');
+  assert.equal(audit.origin.caller.rpcId, String(response.id));
+  assert.equal(audit.actorIdentity, 'unverified');
+});
+
 test('MCP：可启动、initialize、列工具', async () => {
   const rpc = spawnEntry();
   childProc = rpc.proc;

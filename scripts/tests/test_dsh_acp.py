@@ -3,7 +3,9 @@ import io
 import json
 import tempfile
 import unittest
+import contextlib
 from pathlib import Path
+from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('acp', Path(__file__).parents[1] / 'dsh_acp.py')
 acp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(acp)
@@ -45,6 +47,40 @@ class ProtocolTests(unittest.TestCase):
             c = self.client(Path(d), [])
             with self.assertRaisesRegex(RuntimeError, 'disconnected'):
                 c.call('session/prompt', {})
+
+    def test_max_is_verified_before_prompt_for_new_and_resumed_sessions(self):
+        for resume in ('', 'existing-native'):
+            for accepted in (True, False):
+                with self.subTest(resume=resume, accepted=accepted), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    prompt = root / 'prompt.txt'
+                    prompt.write_text('go')
+                    calls = []
+                    class Client:
+                        denied = 0
+                        text = []
+                        process = type('Process', (), {'poll': lambda self: 0})()
+                        def __init__(self, *args): pass
+                        def record(self, value): pass
+                        def finish(self): pass
+                        def call(self, method, params):
+                            calls.append((method, params))
+                            if method == 'initialize':
+                                return {'agentCapabilities': {'sessionCapabilities': {'resume': {}, 'close': {}, 'list': {}}}}
+                            if method == 'session/new': return {'sessionId': 'new-native'}
+                            if method == 'session/set_config_option':
+                                return {'configOptions': [{'id': 'reasoning_effort', 'currentValue': 'max' if accepted else 'high'}]}
+                            if method == 'session/prompt': return {'stopReason': 'end_turn'}
+                            return {}
+                    with patch.object(acp, 'Client', Client), patch.object(acp.runtime, 'cli_command', return_value=['dsh']), contextlib.redirect_stdout(io.StringIO()):
+                        result = acp.run('dsh', 'patch', str(root), str(root), str(prompt), resume, 'run', 'fixture', 'max')
+                    self.assertEqual(result, 0 if accepted else 1)
+                    methods = [method for method, _ in calls]
+                    self.assertEqual('session/new' in methods, not bool(resume))
+                    self.assertEqual('session/prompt' in methods, accepted)
+                    self.assertIn('session/close', methods)
+                    configured = next(params for method, params in calls if method == 'session/set_config_option')
+                    self.assertEqual(configured, {'sessionId': resume or 'new-native', 'configId': 'reasoning_effort', 'value': 'max'})
 
 if __name__ == '__main__':
     unittest.main()

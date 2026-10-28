@@ -9,7 +9,7 @@ import type { AgentSessionOpts } from '../src/main/adapters/types';
 import { buildAppServerEnvironment, ZCodeSession, nativeAskRuleset, seedNativeAskRules, seedNativeAskRulesWithRetry } from '../src/main/adapters/zcode';
 
 class FakeZCodeAppServer {
-  constructor(private modelId = 'glm-5.3-flash', private reasoningLevel: string | null = 'max') {}
+  constructor(private modelId = 'fixture-model', private reasoningLevel: string | null = 'max') {}
   requests: Array<{ method: string; params: any }> = [];
   notifications: Array<{ method: string; params: any }> = [];
   requestHandler: ((method: string, params: any) => Promise<any>) | null = null;
@@ -69,9 +69,9 @@ class FakeZCodeAppServer {
 }
 
 const fixtureOpts = (patch: Partial<AgentSessionOpts> = {}, events: AdapterEvent[] = [], endings: string[] = []): AgentSessionOpts => ({
-  taskId: 'task-1', providerId: 'provider-fixed', cwd: '/tmp/project', model: 'glm-5.3-flash',
+  taskId: 'task-1', providerId: 'provider-fixed', cwd: '/tmp/project', model: 'fixture-model',
   reasoningLevel: 'max',
-  env: { ANTHROPIC_MODEL: 'glm-5.3-flash', ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic', ANTHROPIC_AUTH_TOKEN: 'never-print-this-secret' },
+  env: { ANTHROPIC_MODEL: 'fixture-model', ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic', ANTHROPIC_AUTH_TOKEN: 'never-print-this-secret' },
   canUseTool: async () => ({ behavior: 'allow' }),
   onEvent: (e) => events.push(e), onEnd: (r) => endings.push(r), ...patch,
 });
@@ -118,7 +118,7 @@ test('app-server sends streamed text, interactive permission requests and usage;
   await waitFor(() => endings.length === 1);
   assert.equal(session.nativeSessionId(), 'sess_new');
   assert.deepEqual(server.requests.find((r) => r.method === 'session/create')?.params.model, {
-    providerId: 'cc-glm', modelId: 'glm-5.3-flash', options: { reasoningLevel: 'max' },
+    providerId: 'cc-glm', modelId: 'fixture-model', options: { reasoningLevel: 'max' },
   });
   assert.equal(server.requests.find((r) => r.method === 'session/create')?.params.thoughtLevel, 'max');
   await session.send('second');
@@ -143,7 +143,7 @@ test('app-server resumes existing native session without creating another', asyn
   await waitFor(() => endings.length === 1);
   assert.equal(session.nativeSessionId(), 'sess_existing');
   assert.ok(server.requests.some((r) => r.method === 'session/resume' && r.params.sessionId === 'sess_existing'));
-  assert.ok(server.requests.some((r) => r.method === 'session/setModel' && r.params.model.modelId === 'glm-5.3-flash'));
+  assert.ok(server.requests.some((r) => r.method === 'session/setModel' && r.params.model.modelId === 'fixture-model'));
   assert.ok(server.requests.some((r) => r.method === 'session/setThoughtLevel' && r.params.thoughtLevel === 'max'));
   assert.equal(server.requests.some((r) => r.method === 'session/create'), false);
   await session.close();

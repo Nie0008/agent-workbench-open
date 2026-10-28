@@ -4,6 +4,10 @@
 import type { Query } from '@anthropic-ai/claude-agent-sdk';
 import type { AgentAdapter, AgentSessionHandle, AgentSessionOpts } from './types';
 import { resolveClaudeExecutable } from './types';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { createHash } from 'node:crypto';
+import { workbenchDataDir } from '../paths';
 
 let sdkPromise: Promise<{ query: typeof import('@anthropic-ai/claude-agent-sdk')['query'] }> | null = null;
 async function ensureSdk() {
@@ -20,6 +24,21 @@ const dbgLog = (msg: string) => {
 };
 
 const USER_MESSAGE_TYPE = 'user' as const;
+
+export function skillSessionEnv(env: Record<string, string>): Record<string, string> {
+  const source = path.resolve(env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'));
+  const config = path.join(workbenchDataDir(env), 'claude', createHash('sha256').update(source).digest('hex').slice(0, 16));
+  fsDbg.mkdirSync(config, { recursive: true, mode: 0o700 });
+  // 只挂载 Skill 与原生会话；不引入全局 hooks、模型设置或 MCP。
+  for (const name of ['skills', 'projects']) {
+    const target = path.join(config, name), original = path.join(source, name);
+    const entry = fsDbg.lstatSync(target, { throwIfNoEntry: false });
+    if (!entry) fsDbg.symlinkSync(original, target, process.platform === 'win32' ? 'junction' : 'dir');
+    else if (!entry.isSymbolicLink() || path.resolve(config, fsDbg.readlinkSync(target)) !== original)
+      throw new Error(`Claude 隔离目录冲突，未覆盖现有路径: ${target}`);
+  }
+  return { ...env, CLAUDE_CONFIG_DIR: config };
+}
 
 export class ClaudeCodeSession implements AgentSessionHandle {
   private q: Query | null = null;
@@ -51,7 +70,7 @@ export class ClaudeCodeSession implements AgentSessionHandle {
       }
       if (this.finished) return;
       const msg = this.pending.shift()!;
-      dbgLog(`inputStream 产出消息: ${JSON.stringify(msg).slice(0, 80)}`);
+      dbgLog('inputStream 产出用户消息');
       yield { type: USER_MESSAGE_TYPE, message: msg, parent_tool_use_id: null, session_id: this.nativeId ?? '' };
     }
   }
@@ -66,13 +85,14 @@ export class ClaudeCodeSession implements AgentSessionHandle {
         options: {
           cwd: this.opts.cwd,
           model: this.opts.model,
-          env: this.opts.env,
+          env: skillSessionEnv({ ...this.opts.env,
+            ...(this.opts.reasoningLevel ? { CLAUDE_CODE_EFFORT_LEVEL: this.opts.reasoningLevel } : {}) }),
           pathToClaudeCodeExecutable: resolveClaudeExecutable(),
           permissionMode: 'default',               // 始终保留授权流程，绝不绕过
           // 原生 default 会自行批准只读调用；ask 规则确保全部工具先经过任务策略。
           settings: { permissions: { ask: ['*'] } },
           abortController: this.abort,
-          settingSources: [],                      // 不加载用户全局配置，保证隔离
+          settingSources: ['user'],                // 仅从隔离目录发现全局 Skill
           // 透传 SDK 的 toolUseID/requestId 给统一策略：同一原生调用的协议重试
           // （如传输断开后 reinitialize 重发 can_use_tool）据此共用一条待授权与决定
           ...(this.opts.canUseTool ? { canUseTool: (toolName: string, input: any, options?: any) =>
@@ -185,7 +205,7 @@ export class ClaudeCodeSession implements AgentSessionHandle {
   }
 
   async send(text: string): Promise<void> {
-    dbgLog(`send: finished=${this.finished} 文本=${text.slice(0, 60)}`);
+    dbgLog(`send: finished=${this.finished}`);
     if (this.finished) {
       // 进程已结束：用原生会话恢复一个新的执行流
       await this.pump;

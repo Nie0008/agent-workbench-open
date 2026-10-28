@@ -1,14 +1,15 @@
 // IPC：renderer 与主进程之间的最小契约（contextIsolation 下经 preload 暴露）
-import { app, ipcMain, BrowserWindow } from 'electron';
+import { app, ipcMain, BrowserWindow, type IpcMainInvokeEvent } from 'electron';
+import * as crypto from 'node:crypto';
 import type { TaskService } from './taskService';
-import type { NightlyMemoryService } from './nightlyMemory';
+import type { PermissionResponseOrigin } from './taskService';
 import type { WorkbenchEvent } from '../shared/types';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { tree, readTextFile, writeTextFile, lineDiff, gitDiffPath, isGitRepo } from './files';
 
 export function registerIpc(taskService: TaskService, getWindow: () => BrowserWindow | null, dataDir: string,
-  hideWindow?: () => boolean | Promise<boolean>, nightly?: NightlyMemoryService | null) {
+  hideWindow?: () => boolean | Promise<boolean>) {
   const ts = taskService;
   const ipcLog = (msg: string) => {
     try { fs.appendFileSync(path.join(dataDir, 'main.log'), `${new Date().toISOString()} [ipc] ${msg}\n`); } catch { /* ignore */ }
@@ -20,12 +21,12 @@ export function registerIpc(taskService: TaskService, getWindow: () => BrowserWi
     }
   };
 
-  const h = (channel: string, handler: (p: any) => any) => {
-    ipcMain.handle(channel, async (_ev, payload) => {
+  const h = (channel: string, handler: (p: any, event: IpcMainInvokeEvent) => any) => {
+    ipcMain.handle(channel, async (event, payload) => {
       const t0 = Date.now();
       const slow = setTimeout(() => ipcLog(`慢处理: ${channel} 已 ${Date.now() - t0}ms`), 2000);
       try {
-        const r = { ok: true, data: await handler(payload ?? {}) };
+        const r = { ok: true, data: await handler(payload ?? {}, event) };
         return r;
       } catch (e: any) {
         return { ok: false, error: String(e?.message ?? e) };
@@ -81,7 +82,7 @@ export function registerIpc(taskService: TaskService, getWindow: () => BrowserWi
   h('project.memory.entries.status', (p) => ts.setMemoryStatus(p.projectId,p.id,p.status,p.expectedVersion));
   h('project.memory.entries.replace', (p) => ts.replaceMemoryEntry(p.projectId,p.id,p.expectedVersion,p.entry ?? {}));
   h('project.memory.handoff.create', (p) => ts.createHandoffDraft(p.taskId));
-  h('memory.nightly.status', () => nightly?.status() ?? null);
+  h('memory.nightly.status', () => null);
   h('task.background', (p) => JSON.parse(ts.store.getKV(`background:${p.taskId}`)??'null'));
   h('task.memory.used', (p) => ts.taskMemoryUsed(p.taskId));
   h('projects.list', () => ts.listProjects());
@@ -112,7 +113,25 @@ export function registerIpc(taskService: TaskService, getWindow: () => BrowserWi
   h('task.cancel', (p) => ts.cancel(p.sessionId, { cascade: true }));
   h('events.list', (p) => ts.listEvents(p.sessionId, p.sinceSeq ?? 0));
 
-  h('permissions.respond', (p) => ts.respondPermission(p.permissionId, p.decision, undefined, 'ui'));
+  h('permissions.respond', (p, event) => {
+    const win = getWindow();
+    const expectedFrame = !!win && event.sender === win.webContents && event.senderFrame === win.webContents.mainFrame;
+    const requestId = crypto.randomUUID();
+    ipcLog(`[permission-response] ${JSON.stringify({ requestId, senderId: event.sender.id,
+      rendererProcessId: event.sender.getOSProcessId(), expectedFrame,
+      taskId: typeof p.taskId === 'string' ? p.taskId.slice(0, 200) : null,
+      permissionId: typeof p.permissionId === 'string' ? p.permissionId.slice(0, 200) : null,
+      decision: p.decision === 'allow' || p.decision === 'deny' ? p.decision : 'invalid' })}`);
+    if (!win || !expectedFrame)
+      throw new Error('授权响应不是来自工作台主窗口');
+    const origin: PermissionResponseOrigin = {
+      transport: 'electron-ipc', entryPoint: 'permissions.respond', requestId,
+      window: { id: event.sender.id, processId: event.sender.getOSProcessId(),
+        frameUrl: event.senderFrame!.url, focused: win.isFocused(), visible: win.isVisible() },
+      interaction: { type: p.interaction?.type === 'click' ? 'click' : 'unknown', trusted: p.interaction?.trusted === true },
+    };
+    return ts.respondPermission(p.permissionId, p.decision, typeof p.taskId === 'string' ? p.taskId : undefined, 'ui', origin);
+  });
 
   h('settings.get', () => ts.getSettings());
   h('settings.set', (p) => ts.setSettings(p));

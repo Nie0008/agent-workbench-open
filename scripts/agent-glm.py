@@ -28,7 +28,8 @@ def main():
  p=argparse.ArgumentParser(description=__doc__)
  p.add_argument('tool',choices=['dsh','zcode']);p.add_argument('action',choices=['check','smoke','run','list','status'])
  p.add_argument('--cwd',type=Path,required=True);p.add_argument('--provider-id');p.add_argument('--prompt-file',type=Path)
- p.add_argument('--model',default=shared.MODEL)
+ p.add_argument('--model',required=True)
+ p.add_argument('--reasoning-effort',help='DSH ACP reasoning level; ZCode app-server uses its model profile')
  p.add_argument('--resume');p.add_argument('--timeout',type=int,default=300)
  p.add_argument('--workbench-task-id');p.add_argument('--workbench-event-file',type=Path);p.add_argument('--workbench-control-dir',type=Path)
  p.add_argument('--mode',choices=['plan','build','edit'],default='plan',help='ZCode permission mode; never auto-approve')
@@ -36,6 +37,7 @@ def main():
  model=a.model
  if not model or any(c.isspace() for c in model):raise ValueError('Invalid model ID')
  if not cwd.is_dir():raise ValueError('cwd must be a directory')
+ if a.reasoning_effort and a.tool!='dsh':raise ValueError('reasoning-effort is only supported by the DSH entry')
  if a.action in ['list','status'] and a.tool!='dsh':raise ValueError('list/status are only supported for DSH')
  if not 10<=a.timeout<=14400:raise ValueError('timeout must be 10..14400 seconds')
  if a.action=='run' and not a.prompt_file:raise ValueError('run requires --prompt-file')
@@ -123,7 +125,7 @@ def main():
      env['WORKBENCH_DSH_CONTROL_DIR']=str(a.workbench_control_dir)
     prompt_path=tmp/'prompt.txt';prompt_path.write_text(prompt)
     run_id=secrets.token_hex(12)
-    cmd=[sys.executable,str(Path(__file__).with_name('dsh_acp.py')),str(dsh),str(f),str(state),str(cwd),str(prompt_path),a.resume or '',a.action,run_id]
+    cmd=[sys.executable,str(Path(__file__).with_name('dsh_acp.py')),str(dsh),str(f),str(state),str(cwd),str(prompt_path),a.resume or '',a.action,run_id,a.reasoning_effort or '']
    else:
     data=state/'data';cli=data/'.zcode/cli';cli.mkdir(parents=True,exist_ok=True,mode=0o700)
     env['ZCODE_DATA_BASE_DIR']=str(data)

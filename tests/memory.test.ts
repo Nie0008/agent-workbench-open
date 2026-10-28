@@ -7,7 +7,6 @@ import { Store } from '../src/main/store';
 import { CredentialManager } from '../src/main/credentials';
 import { TaskService } from '../src/main/taskService';
 import { MockAdapter } from '../src/main/adapters/mock';
-import { NightlyMemoryService, dueDay } from '../src/main/nightlyMemory';
 
 let tmp: string;
 let store: Store;
@@ -28,7 +27,7 @@ function memory(projectId:string, title:string, body:string, extra:Record<string
   return ts.createMemoryEntry({projectId,kind:'lesson',title,body,source:'docs/guide.md',...extra});
 }
 function makeTask(projectId:string, id='task-1') {
-  store.createSession({id,projectId,kind:'main',parentSessionId:null,title:'Node 包管理器任务',agentId:'mock',model:'glm-5.3-flash',cwd:ts.store.getProject(projectId)!.rootPath,scope:{fileWrite:false}});
+  store.createSession({id,projectId,kind:'main',parentSessionId:null,title:'Node 包管理器任务',agentId:'mock',model:'fixture-model',cwd:ts.store.getProject(projectId)!.rootPath,scope:{fileWrite:false}});
   return ts.getSession(id)!;
 }
 function wait(ms:number) { return new Promise((resolve)=>setTimeout(resolve,ms)); }
@@ -300,71 +299,4 @@ test('handoff drafts quote only a successful recorded result and are idempotent'
   store.appendEvent(canceled.id,'result',{isError:false,numTurns:1,text:'Old result'});
   store.updateSession(canceled.id,{status:'canceled'});
   assert.throws(()=>ts.createHandoffDraft(canceled.id),/不能生成成功交接草稿/);
-});
-
-test('nightly memory starts from new successful Workbench turns and leaves sourced drafts for review',async()=>{
-  const p=project();
-  const old=makeTask(p.id,'old-turn');
-  store.appendEvent(old.id,'result',{isError:false,text:'Old result before activation.'});
-  let calls=0;
-  const nightly=new NightlyMemoryService(ts,async(turn)=>{
-    calls++;
-    assert.equal(turn.title,'Node 包管理器任务');
-    assert.equal(turn.request,'请核对依赖命令');
-    assert.ok(turn.result.includes('验证命令 npm test 通过'));
-    return {model:'fixture-glm',text:JSON.stringify({items:[{title:'先跑项目测试',
-      body:'提交前执行 npm test，并核对退出码。',quote:'验证命令 npm test 通过',scope:'project'}]})};
-  });
-  nightly.initialize(new Date(2026,8,27,2));
-  const task=makeTask(p.id,'new-turn');
-  store.appendEvent(task.id,'message',{role:'user',text:'本次要求：\n请核对依赖命令'});
-  const result=store.appendEvent(task.id,'result',{isError:false,text:'验证命令 npm test 通过，退出码 0。'});
-  const failed=makeTask(p.id,'failed-turn');
-  store.appendEvent(failed.id,'result',{isError:true,text:'验证失败，不可视为成功'});
-  assert.equal(dueDay(new Date(2026,8,27,2,59)),'2026-09-26');
-  const before=await nightly.runIfDue(new Date(2026,8,27,2,59));
-  assert.equal(before.processedTurns,0);
-  const status=await nightly.runIfDue(new Date(2026,8,27,3,1));
-  assert.equal(status.error,null);
-  assert.equal(status.processedTurns,1);
-  assert.equal(status.newDrafts,1);
-  assert.equal(calls,1);
-  const drafts=ts.listMemoryEntries(p.id);
-  assert.equal(drafts.length,1);
-  assert.equal(drafts[0].status,'draft');
-  assert.equal(drafts[0].taskId,task.id);
-  assert.ok(drafts[0].evidenceRefs.includes(`event:${task.id}:seq:${result.seq}`));
-  assert.ok(drafts[0].body.includes('原文依据：验证命令 npm test 通过'));
-  const next=makeTask(p.id,'no-injection');
-  assert.equal(ts.memory.prepareTaskInjection(next.id,'npm test').entries.length,0);
-  await nightly.runIfDue(new Date(2026,8,27,4));
-  assert.equal(calls,1,'同一夜间窗口不重复调用模型');
-  const repeat=makeTask(p.id,'same-lesson-turn');
-  store.appendEvent(repeat.id,'message',{role:'user',text:'请核对依赖命令'});
-  const repeatResult=store.appendEvent(repeat.id,'result',{isError:false,text:'验证命令 npm test 通过，退出码 0。'});
-  const nextNight=await nightly.runIfDue(new Date(2026,8,28,3,1));
-  assert.equal(nextNight.newDrafts,0,'同内容经验不重复创建');
-  assert.equal(ts.listMemoryEntries(p.id).length,1);
-  assert.ok(ts.listMemoryEntries(p.id)[0].evidenceRefs.includes(`event:${repeat.id}:seq:${repeatResult.seq}`));
-});
-
-test('nightly memory retries a failed model response without advancing the source cursor',async()=>{
-  const p=project();
-  let calls=0;
-  const nightly=new NightlyMemoryService(ts,async()=>{
-    calls++;
-    return {model:'fixture-glm',text:calls===1 ? '{bad json' : JSON.stringify({items:[{
-      title:'结果核验',body:'对结果执行复核。',quote:'本次核验通过',scope:'domain'}]})};
-  });
-  nightly.initialize(new Date(2026,8,27,1));
-  const task=makeTask(p.id,'retry-turn');
-  store.appendEvent(task.id,'result',{isError:false,text:'本次核验通过，但仍须人工查看。'});
-  const first=await nightly.runIfDue(new Date(2026,8,27,3));
-  assert.match(first.error ?? '',/JSON/);
-  assert.equal(ts.listMemoryEntries(p.id).length,0);
-  const second=await nightly.runIfDue(new Date(2026,8,27,3,1));
-  assert.equal(second.error,null);
-  assert.equal(second.newDrafts,1);
-  assert.equal(calls,2);
-  assert.equal(ts.listMemoryEntries(p.id)[0].status,'draft');
 });

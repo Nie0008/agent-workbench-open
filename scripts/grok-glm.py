@@ -3,7 +3,6 @@
 import argparse, hashlib, json, os, shutil, signal, sqlite3, subprocess, sys
 from pathlib import Path
 
-MODEL = 'glm-5.3-flash'
 BASE = 'https://open.bigmodel.cn/api/coding/paas/v4'
 
 def runtime_executable(command, override=None, env=None):
@@ -90,7 +89,8 @@ def provider(db, selected=None):
         raise ValueError('Grok 自定义模型入口仅支持智谱 Anthropic 凭据')
     return pid,key
 
-def prepare(cwd, db, state_root, selected=None, task_id=None, model=MODEL):
+def prepare(cwd, db, state_root, selected=None, task_id=None, model=None):
+    if not model or any(c.isspace() for c in model): raise ValueError('Explicit model ID required')
     pid,key=provider(db,selected)
     scope=str(cwd) if not task_id else str(cwd)+'\\0'+task_id
     home=state_root/hashlib.sha256(scope.encode()).hexdigest()[:20]
@@ -126,7 +126,8 @@ def main():
     p.add_argument('action',choices=['check','run','smoke','acp'])
     p.add_argument('--cwd',required=True,type=Path)
     p.add_argument('--provider-id')
-    p.add_argument('--model',default=MODEL)
+    p.add_argument('--model',required=True)
+    p.add_argument('--reasoning-effort')
     p.add_argument('--workbench-task-id')
     p.add_argument('--prompt-file',type=Path)
     p.add_argument('--resume',help='Exact Grok native session ID created under this entry')
@@ -154,7 +155,7 @@ def main():
         # Route explicit delegation through Workbench MCP so child tasks are visible
         # and governed by TaskService rather than hidden Grok subagent sessions.
         env['GROK_SUBAGENTS']='0'
-        command=[str(binary),'agent','--no-leader','--model',a.model,'stdio']
+        command=[str(binary),'agent','--no-leader','--model',a.model]+(['--reasoning-effort',a.reasoning_effort] if a.reasoning_effort else [])+['stdio']
         if os.name != 'nt': os.execve(str(binary),command,env)
         # Windows exec does not provide POSIX PID replacement semantics. Keep
         # this launcher alive as the owner of the inherited ACP stdio process.
@@ -165,6 +166,7 @@ def main():
     print(json.dumps({'configurationLoaded':True,**binding,'grokHome':str(home),'inferenceVerified':False},ensure_ascii=False),flush=True)
     prompt='Reply only: GLM_ENTRY_OK. Do not use any tools.' if a.action=='smoke' else a.prompt_file.read_text()
     cmd=[str(binary),'-p',prompt,'--model',a.model,'--cwd',str(cwd),'--output-format','streaming-json','--max-turns',str(1 if a.action=='smoke' else a.max_turns),'--tools','' if a.action=='smoke' else a.tools,'--disable-web-search']
+    if a.reasoning_effort: cmd+=['--reasoning-effort',a.reasoning_effort]
     if a.resume: cmd+=['--resume',a.resume]
     # No --always-approve: authorization remains with Grok.
     return subprocess.run(cmd,env=env,cwd=cwd).returncode

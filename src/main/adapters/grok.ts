@@ -244,9 +244,10 @@ export class GrokSession implements AgentSessionHandle {
           throw new Error('Grok 任务缺少有效的模型与供应商绑定');
         const python=isNative ? '' : (this.deps.pythonPath || resolvePythonExecutable());
         if(isNative && !this.deps.grokPath)throw new Error('未找到 Grok CLI，请加入 PATH 或设置 WORKBENCH_GROK_PATH');
+        const reasoningArgs = this.opts.reasoningLevel ? ['--reasoning-effort', this.opts.reasoningLevel] : [];
         const args = isNative
-          ? ['agent', '--no-leader', '--model', this.opts.model, 'stdio']
-          : [...pythonArguments(python),this.deps.scriptPath, 'acp', '--cwd', this.opts.cwd, '--provider-id', this.opts.providerId!, '--model', this.opts.model];
+          ? ['agent', '--no-leader', '--model', this.opts.model, ...reasoningArgs, 'stdio']
+          : [...pythonArguments(python),this.deps.scriptPath, 'acp', '--cwd', this.opts.cwd, '--provider-id', this.opts.providerId!, '--model', this.opts.model, ...reasoningArgs];
         if (!isNative && this.opts.taskId) args.push('--workbench-task-id', this.opts.taskId);
         const env={...this.opts.env};
         if(!isNative && this.deps.grokPath)env.WORKBENCH_GROK_PATH=this.deps.grokPath;

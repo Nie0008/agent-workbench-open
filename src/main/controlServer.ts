@@ -4,8 +4,7 @@ import * as http from 'node:http';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
-import type { TaskService } from './taskService';
-import type { NightlyMemoryService } from './nightlyMemory';
+import type { TaskService, PermissionResponseOrigin } from './taskService';
 
 export interface ControlServerInfo { port: number; token: string; }
 
@@ -18,7 +17,7 @@ export class ControlServer {
   desktopFn: ((action?: 'show' | 'hide') => Promise<unknown>) | null = null;
   openTaskFn: ((taskId: string) => void) | null = null;   // 通知点击同款入口：打开工作台并定位任务
 
-  constructor(private taskService: TaskService, private nightly?: NightlyMemoryService | null) {
+  constructor(private taskService: TaskService) {
     this.server = http.createServer((req, res) => this.route(req, res));
   }
 
@@ -52,8 +51,19 @@ export class ControlServer {
     req.on('end', async () => {
       let out: any;
       try {
-        const { method, params } = JSON.parse(body);
-        out = await this.handle(method, params ?? {}, abort.signal);
+        const { method, params, caller } = JSON.parse(body);
+        const origin: PermissionResponseOrigin = { transport: 'control-http', requestId: crypto.randomUUID(),
+          entryPoint: typeof method === 'string' && /^[a-zA-Z0-9_.]{1,80}$/.test(method) ? method : 'unknown',
+          remoteAddress: req.socket.remoteAddress, caller: {} };
+        // 只保存调用者的白名单元数据；令牌、环境、工具输入不进入来源记录。
+        for (const key of ['name', 'version', 'sessionId', 'parentTaskId', 'tool', 'rpcId']) {
+          const value = caller?.[key];
+          if (typeof value === 'string' && value.length <= 200 && !/[\r\n\0]/.test(value)) origin.caller![key] = value;
+        }
+        for (const key of ['pid', 'parentPid']) {
+          if (Number.isSafeInteger(caller?.[key]) && caller[key] > 0) origin.caller![key] = caller[key];
+        }
+        out = await this.handle(method, params ?? {}, abort.signal, origin);
       } catch (e: any) {
         out = { ok: false, error: String(e?.message ?? e) };
       }
@@ -63,7 +73,7 @@ export class ControlServer {
     });
   }
 
-  private async handle(method: string, p: any, signal?: AbortSignal): Promise<any> {
+  private async handle(method: string, p: any, signal?: AbortSignal, origin?: PermissionResponseOrigin): Promise<any> {
     const ts = this.taskService;
     switch (method) {
       case 'app.window': {
@@ -93,7 +103,7 @@ export class ControlServer {
       case 'app.info':
         return { ok: true, version: ts.store.getKV('appVersion'), provider: ts.credentials.listProviderInfos() };
       case 'memory.nightly.status':
-        return { ok:true, status:this.nightly?.status() ?? null };
+        return { ok:true, status:null };
       case 'agents.options': {
         return { ok: true, ...ts.agentOptions(p.refreshModels === true) };
       }
@@ -187,12 +197,11 @@ export class ControlServer {
       }
       case 'permissions.list': return ts.listPendingPermissions(p.taskId);
       case 'permissions.respondTask':
-        if (typeof p.taskId !== 'string' || !p.taskId) return {ok:false,error:'必须指定任务'};
         if (p.decision !== 'allow' && p.decision !== 'deny') return {ok:false,error:'decision 仅支持 allow/deny'};
-        return ts.respondPermission(p.permissionId, p.decision, p.taskId, 'control');
+        return ts.respondPermission(p.permissionId, p.decision, typeof p.taskId === 'string' ? p.taskId : undefined, 'control', origin);
       case 'permissions.respond':
         if (p.decision !== 'allow' && p.decision !== 'deny') return {ok:false,error:'decision 仅支持 allow/deny'};
-        return ts.respondPermission(p.permissionId, p.decision, undefined, 'control');
+        return ts.respondPermission(p.permissionId, p.decision, typeof p.taskId === 'string' ? p.taskId : undefined, 'control', origin);
       case 'settings.get':
         return { ok: true, settings: ts.getSettings() };
       case 'settings.set':

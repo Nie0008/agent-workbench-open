@@ -117,7 +117,7 @@ def save_receipt(path, report):
     temp.replace(path)
 
 
-def run(binary, patch, state, cwd, prompt, resume, action, run_id):
+def run(binary, patch, state, cwd, prompt, resume, action, run_id, reasoning_effort=''):
     os.umask(0o077)
     state = Path(state)
     event_file = Path(os.environ['WORKBENCH_DSH_EVENT_FILE']) if os.environ.get('WORKBENCH_DSH_EVENT_FILE') else state / ('events-' + run_id + '.jsonl')
@@ -149,6 +149,13 @@ def run(binary, patch, state, cwd, prompt, resume, action, run_id):
                 sid = client.call('session/new', params)['sessionId']
             opened = True
             report['sessionId'] = sid
+            if reasoning_effort:
+                config = client.call('session/set_config_option', {'sessionId': sid,
+                                     'configId': 'reasoning_effort', 'value': reasoning_effort})
+                if not any(option.get('id') == 'reasoning_effort' and option.get('currentValue') == reasoning_effort
+                           for option in config.get('configOptions', [])):
+                    raise RuntimeError('DSH did not apply the requested reasoning effort')
+                report['reasoningEffort'] = reasoning_effort
             client.record({'type': 'session_opened', 'sessionId': sid, 'resumed': bool(resume)})
             # Save receipt before prompt, so an interrupted run can be recovered explicitly.
             receipt = state / ('run-' + run_id + '.json')

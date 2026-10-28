@@ -82,6 +82,7 @@ export class DshSession implements AgentSessionHandle {
       '--prompt-file', promptFile, '--provider-id', this.opts.providerId, '--model', this.opts.model,
       '--timeout', '14400', '--workbench-task-id', this.opts.taskId ?? path.basename(runDir),
       '--workbench-event-file', this.eventFile, '--workbench-control-dir', controlDir];
+    if (this.opts.reasoningLevel) args.push('--reasoning-effort', this.opts.reasoningLevel);
     if (this.nativeId) args.push('--resume', this.nativeId);
     const env = this.opts.providerId.startsWith('workbench-local:')
       ? { ...this.opts.env } : { ...process.env } as NodeJS.ProcessEnv;

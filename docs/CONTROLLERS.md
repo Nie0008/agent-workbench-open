@@ -139,6 +139,8 @@ dsh --profile headless --patch /absolute/path/to/workbench-mcp.json "列出 Work
   "title": "核对项目说明",
   "prompt": "读取项目 README，返回需要更正的事实和对应文件位置，不修改文件。",
   "agentId": "AGENT_ID_FROM_OPTIONS",
+  "providerId": "PROVIDER_ID_FROM_OPTIONS",
+  "model": "MODEL_FROM_OPTIONS",
   "clientRequestId": "STABLE_REQUEST_ID",
   "fileWrite": false,
   "bash": "none",

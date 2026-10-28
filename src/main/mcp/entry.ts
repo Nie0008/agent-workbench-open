@@ -8,6 +8,7 @@ import * as http from 'node:http';
 import { workbenchDataDir } from '../paths';
 
 interface Control { port: number; token: string; }
+let clientInfo: { name?: string; version?: string } = {};
 
 const args = process.argv.slice(2);
 const parentIndex = args.indexOf('--parent-task-id');
@@ -27,11 +28,11 @@ function loadControl(): Control | null {
   } catch { return null; }
 }
 
-function rpc(method: string, params: any): Promise<any> {
+function rpc(method: string, params: any, caller?: Record<string, unknown>): Promise<any> {
   const control = loadControl();
   if (!control) return Promise.resolve({ ok: false, error: '工作台应用未运行（未找到 control.json）。请先启动 Agent Workbench。' });
   return new Promise((resolve) => {
-    const body = JSON.stringify({ method, params });
+    const body = JSON.stringify({ method, params, caller });
     const req = http.request({
       host: '127.0.0.1', port: control.port, method: 'POST', path: '/v1/rpc',
       agent: false,   // 短连接：不保留 keep-alive 套接字
@@ -154,7 +155,7 @@ const AGENT_TOOLS = [
 
 function write(msg: any) { process.stdout.write(JSON.stringify(msg) + '\n'); }
 
-async function callTool(name: string, args: any): Promise<any> {
+async function callTool(name: string, args: any, rpcId: unknown): Promise<any> {
   let r: any;
   if (parentTaskId) {
     switch (name) {
@@ -166,7 +167,9 @@ async function callTool(name: string, args: any): Promise<any> {
       case 'get_task_events': r = await rpc('agent.subtask.events', { parentTaskId, taskId: args?.task_id, sinceSeq: args?.since_seq }); break;
       default: r = { ok: false, error: '该 Agent 没有此 Workbench 工具' };
     }
-  } else if (EXTRA[name]) r = await rpc(EXTRA[name].method,args);
+  } else if (EXTRA[name]) r = await rpc(EXTRA[name].method,args, {
+    ...clientInfo, tool: name, rpcId: String(rpcId), pid: process.pid, parentPid: process.ppid,
+  });
   else switch (name) {
     case 'workbench_list_projects': r = await rpc('projects.list', {}); break;
     case 'workbench_list_tasks': r = await rpc('tasks.list', { projectId: args?.projectId }); break;
@@ -196,6 +199,7 @@ async function main() {
     try { msg = JSON.parse(line); } catch { return; }
     const { id, method, params } = msg;
     if (method === 'initialize') {
+      clientInfo = { name: params?.clientInfo?.name, version: params?.clientInfo?.version };
       write({
         jsonrpc: '2.0', id, result: {
           protocolVersion: params?.protocolVersion ?? '2025-06-18',
@@ -209,7 +213,7 @@ async function main() {
     if (method === 'ping') { write({ jsonrpc: '2.0', id, result: {} }); return; }
     if (method === 'tools/list') { write({ jsonrpc: '2.0', id, result: { tools: parentTaskId ? AGENT_TOOLS : TOOLS } }); return; }
     if (method === 'tools/call') {
-      const result = await callTool(params?.name, params?.arguments);
+      const result = await callTool(params?.name, params?.arguments, id);
       write({ jsonrpc: '2.0', id, result });
       return;
     }

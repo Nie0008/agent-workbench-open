@@ -61,8 +61,7 @@ export class ModelCatalog {
       const zhipu = source.baseUrl.replace(/\/$/, '') === 'https://open.bigmodel.cn/api/anthropic';
       profiles.push({ id: crypto.randomUUID(), name: source.name, providerId: source.providerId,
         model: source.model, agents: native ? ['grok'] : source.providerId === 'native:claude' ? ['claude-code'] : zhipu ? [...AGENT_IDS] : ['claude-code', 'dsh', 'zcode'],
-        sourceFingerprint: fingerprint(source),
-        ...(source.model === 'glm-5.3-flash' && !native ? { reasoningLevel: 'max' } : {}) });
+        sourceFingerprint: fingerprint(source) });
       added++;
     }
     if (added) this.store.setKV(MODEL_CATALOG_KEY, JSON.stringify(profiles));

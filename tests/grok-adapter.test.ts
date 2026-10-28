@@ -10,7 +10,7 @@ import type { AdapterEvent } from '../src/shared/types';
 
 type Rpc = { jsonrpc: string; id?: number | string; method?: string; params?: any; result?: any };
 type Fixture = ReturnType<typeof fixture>;
-function fixture(onRequest?: (request: Rpc, child: any) => any, resumeId?: string, permissionGate?: Promise<any>, sharedTemp?: string, native: boolean | string = false, ccModel = 'glm-5.3-flash') {
+function fixture(onRequest?: (request: Rpc, child: any) => any, resumeId?: string, permissionGate?: Promise<any>, sharedTemp?: string, native: boolean | string = false, ccModel = 'fixture-model', reasoningLevel?: string) {
   const temp = sharedTemp ?? fs.mkdtempSync(path.join(os.tmpdir(), 'wb-grok-acp-'));
   const requests: Rpc[] = [];
   const clientResponses: Rpc[] = [];
@@ -23,7 +23,8 @@ function fixture(onRequest?: (request: Rpc, child: any) => any, resumeId?: strin
     spawnCalls.push({ bin: _bin, args, env: options.env });
     if (native) {
       assert.equal(_bin, '/fixed/grok');
-      assert.deepEqual(args, ['agent', '--no-leader', '--model', native === true ? 'grok-4.7' : native, 'stdio']);
+      assert.deepEqual(args, ['agent', '--no-leader', '--model', native === true ? 'grok-4.7' : native,
+        ...(reasoningLevel ? ['--reasoning-effort', reasoningLevel] : []), 'stdio']);
       assert.equal(options.env.ANTHROPIC_AUTH_TOKEN, undefined);
     } else {
       assert.equal(args[1], 'acp');
@@ -57,6 +58,7 @@ function fixture(onRequest?: (request: Rpc, child: any) => any, resumeId?: strin
   }) as any;
   const session = new GrokSession({
     taskId: 'task-parent', allowDelegation: true,
+    reasoningLevel,
     cwd: temp, model: native ? native === true ? 'grok-4.7' : native : ccModel,
     providerId: typeof native === 'string' ? `grok-config:${native}:0123456789abcdef`
       : native ? 'grok-super-oauth' : 'provider-fixed',
@@ -78,8 +80,8 @@ function fixture(onRequest?: (request: Rpc, child: any) => any, resumeId?: strin
 }
 function defaultResponse(request: Rpc): any {
   if (request.method === 'initialize') return { protocolVersion: 1, agentCapabilities: { loadSession: true } };
-  if (request.method === 'session/new') return { sessionId: 'native-42', configOptions: [{ id: 'model', currentValue: 'glm-5.3-flash' }] };
-  if (request.method === 'session/load') return { configOptions: [{ id: 'model', currentValue: 'glm-5.3-flash' }] };
+  if (request.method === 'session/new') return { sessionId: 'native-42', configOptions: [{ id: 'model', currentValue: 'fixture-model' }] };
+  if (request.method === 'session/load') return { configOptions: [{ id: 'model', currentValue: 'fixture-model' }] };
   if (request.method === 'session/prompt') return { stopReason: 'end_turn' };
   return {};
 }
@@ -91,6 +93,20 @@ async function waitEnd(ends: Fixture['ends'], count: number) {
   while (ends.length < count && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(ends.length, count, 'adapter should settle the run');
 }
+
+test('Grok forwards configured reasoning effort for both GLM models and native bindings', async () => {
+  for (const model of ['fixture-model', 'second-model', 'grok-4.7']) {
+    const f = fixture((request) => ['session/new', 'session/load'].includes(request.method ?? '')
+      ? { sessionId: 'native-effort', configOptions: [{ id: 'model', currentValue: model }] }
+      : defaultResponse(request), undefined, undefined, undefined, model === 'grok-4.7', model, 'max');
+    try {
+      await f.session.send('go'); await waitEnd(f.ends, 1);
+      assert.equal(f.ends[0].reason, 'done');
+      const args = f.spawnCalls[0].args;
+      assert.equal(args[args.indexOf('--reasoning-effort') + 1], 'max');
+    } finally { await f.session.close(); f.dispose(); }
+  }
+});
 
 test('ACP streams assistant/tool events, binds Workbench MCP, and loads the exact native session', async () => {
   const f = fixture((request, child) => {
@@ -162,7 +178,7 @@ test('native Grok Super uses OAuth CLI with the selected model and rejects a mod
   } finally { await f.session.close(); f.dispose(); }
 
   const wrong = fixture((request) => {
-    if (request.method === 'session/new') return { sessionId: 'native-wrong', configOptions: [{ id: 'model', currentValue: 'glm-5.3-flash' }] };
+    if (request.method === 'session/new') return { sessionId: 'native-wrong', configOptions: [{ id: 'model', currentValue: 'fixture-model' }] };
     return defaultResponse(request);
   }, undefined, undefined, undefined, true);
   try {
@@ -251,7 +267,7 @@ test('Grok prompt has no fixed 15-minute cutoff and forwards progress without pr
 
 test('rejects credential-bearing errors and closes the process', async () => {
   const f = fixture((request) => {
-    if (request.method === 'session/new') return { sessionId: 'native-42', configOptions: [{ id: 'model', currentValue: 'glm-5.3-flash' }] };
+    if (request.method === 'session/new') return { sessionId: 'native-42', configOptions: [{ id: 'model', currentValue: 'fixture-model' }] };
     if (request.method === 'session/prompt') return { stopReason: 'end_turn' };
     return defaultResponse(request);
   });

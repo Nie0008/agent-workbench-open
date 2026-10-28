@@ -22,6 +22,7 @@ event=value('--workbench-event-file')
 control=value('--workbench-control-dir')
 resume='--resume' in args
 model=value('--model')
+if model=='second-model': assert value('--reasoning-effort')=='max'
 with open(event,'w') as f:
  f.write(json.dumps({'type':'session_opened','sessionId':'native-dsh-123','resumed':resume})+'\\n')
  f.write(json.dumps({'method':'session/update','params':{'update':{'sessionUpdate':'tool_call','toolCallId':'tool-1','title':'Read','rawInput':{'path':'test.txt'}}}})+'\\n')
@@ -49,7 +50,7 @@ test('DSH ACP events, Workbench permission, native resume and process cleanup', 
   const ends: string[] = [];
   const prompts: string[] = [];
   const session = new DshSession({
-    taskId: 'task-test', providerId: 'provider-test', cwd: root, model: 'glm-5.3-flash', env: {},
+    taskId: 'task-test', providerId: 'provider-test', cwd: root, model: 'fixture-model', env: {},
     onEvent: (event) => events.push(event), onEnd: (reason) => ends.push(reason),
     canUseTool: async (name, input): Promise<PermissionOutcome> => {
       prompts.push(`${name}:${JSON.stringify(input)}`);
@@ -85,7 +86,7 @@ test('DSH passes a configured second model through to the launcher', async () =>
   const events: AdapterEvent[] = [];
   const ends: string[] = [];
   const session = new DshSession({ taskId: 'second-model-task', providerId: 'source', cwd: root,
-    model: 'second-model', env: {}, onEvent: (event) => events.push(event),
+    model: 'second-model', reasoningLevel: 'max', env: {}, onEvent: (event) => events.push(event),
     onEnd: (reason) => ends.push(reason), canUseTool: async () => ({ behavior: 'allow' }) }, script, '/usr/bin/python3');
   try {
     await session.send('go');

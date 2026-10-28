@@ -16,8 +16,8 @@ test('Workbench catalog shares configured models across local agents and rejects
   const db = new DatabaseSync(cc);
   db.exec('CREATE TABLE providers(id TEXT PRIMARY KEY,app_type TEXT,name TEXT,settings_config TEXT,is_current INTEGER,sort_index INTEGER)');
   const insert = db.prepare('INSERT INTO providers VALUES (?,?,?,?,?,?)');
-  insert.run('good', 'claude', 'Zhipu', JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic', ANTHROPIC_MODEL: 'glm-5.3-flash', ANTHROPIC_AUTH_TOKEN: 'FAKE_KEY' } }), 1, 0);
-  insert.run('wrong', 'claude', 'Other', JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'https://other.invalid/api', ANTHROPIC_MODEL: 'glm-5.3-flash', ANTHROPIC_AUTH_TOKEN: 'FAKE_KEY' } }), 0, 1);
+  insert.run('good', 'claude', 'Zhipu', JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic', ANTHROPIC_MODEL: 'fixture-model', ANTHROPIC_AUTH_TOKEN: 'FAKE_KEY' } }), 1, 0);
+  insert.run('wrong', 'claude', 'Other', JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'https://other.invalid/api', ANTHROPIC_MODEL: 'fixture-model', ANTHROPIC_AUTH_TOKEN: 'FAKE_KEY' } }), 0, 1);
   db.close();
   const store = new Store(path.join(root, 'wb.db'));
   const configured: ProviderInfo = { providerId: 'grok-config:grok-4.6:0123456789abcdef',
@@ -33,7 +33,7 @@ test('Workbench catalog shares configured models across local agents and rejects
       const session = service.createMainSession({ projectId: project.id, title: agentId, agentId, providerId: 'good' });
       assert.equal((service as any).adapterFor(session).id, agentId);
       assert.equal(session.providerId, 'good');
-      assert.equal(session.model, 'glm-5.3-flash');
+      assert.equal(session.model, 'fixture-model');
       if (agentId === 'grok') assert.throws(() => service.createMainSession({ projectId: project.id, title: 'wrong', agentId, providerId: 'wrong' }), /组合无效/);
       assert.throws(() => service.createMainSession({ projectId: project.id, title: 'wrong model', agentId, providerId: 'good', model: 'other' }), /组合无效/);
     }
@@ -53,7 +53,7 @@ test('Workbench catalog shares configured models across local agents and rejects
     assert.equal(service.resolveSessionProvider(native.id).ok, true);
     assert.equal((service as any).buildEnv(native).GROK_HOME, path.join(os.homedir(), '.grok'));
     assert.throws(() => service.createMainSession({ projectId: project.id, title: 'bad native',
-      agentId: 'grok', providerId: 'grok-super-oauth', model: 'glm-5.3-flash' }), /组合无效/);
+      agentId: 'grok', providerId: 'grok-super-oauth', model: 'fixture-model' }), /组合无效/);
     assert.throws(() => service.createMainSession({ projectId: project.id, title: 'bad agent',
       agentId: 'dsh', providerId: 'grok-super-oauth', model: 'grok-4.7' }), /不可用|组合无效/);
     const combos = service.agentOptions().combinations;
@@ -89,11 +89,11 @@ test('Grok catalog keeps an existing model binding when another model is added',
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-grok-catalog-'));
   const file = path.join(root, 'config.toml');
   const catalog = () => listGrokConfigProviders({ grokHome: root,
-    listModels: () => 'Available models:\n  * grok-4.7 (default)\n  - glm-5.3-flash\n  - grok-4.6\n' });
+    listModels: () => 'Available models:\n  * grok-4.7 (default)\n  - fixture-model\n  - grok-4.6\n' });
   try {
-    fs.writeFileSync(file, '[auth_provider.glm]\ncommand = "token-helper"\n[model."glm-5.3-flash"]\nmodel = "glm-5.3-flash"\nbase_url = "https://a.invalid"\nauth_provider = "glm"\n');
+    fs.writeFileSync(file, '[auth_provider.glm]\ncommand = "token-helper"\n[model."fixture-model"]\nmodel = "fixture-model"\nbase_url = "https://a.invalid"\nauth_provider = "glm"\n');
     const first = catalog();
-    assert.deepEqual(first.map((p) => p.model), ['glm-5.3-flash', 'grok-4.6']);
+    assert.deepEqual(first.map((p) => p.model), ['fixture-model', 'grok-4.6']);
     assert.equal(grokSuperConfigAvailable(root), true);
     fs.appendFileSync(file, '[model."new-model"]\nmodel = "new-model"\n');
     assert.equal(catalog()[0].providerId, first[0].providerId);
